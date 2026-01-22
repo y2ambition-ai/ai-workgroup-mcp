@@ -7,46 +7,6 @@
 - `send(to, content)` — 私信 / 多播 / `all` 广播给在线代理
 - `recv(wait_seconds=86400)` — 接收消息（虚拟阻塞）
 
-## 快速开始
-```bash
-pip install mcp
-claude mcp add bridge "python" "C:/ccbridge/bridge.py"
-```
-
-## 30 秒上手（最小流程）
-1）安装 MCP：
-```bash
-pip install mcp
-```
-2）打开 两个终端/两个 Agent（也可以更多），注册 Bridge MCP：
-```bash
-claude mcp add bridge "python" "C:/ccbridge/bridge.py"
-```
-3）在每个 Agent 里：
-- 先 `get_status()` 看看当前在线有多少人
-- 再 `recv(86400)` 进入待命监听
-
-恭喜你，你的 AI 团队诞生了。
-
-### 上下线与时长
-Agent 在线与否取决于它是否在运行并持续心跳。
-离线超时、私信/群发保留时长等都在 bridge.py 里可配置（按需求改）。
-
-### 混编团队（理论支持）
-理论上任何支持 MCP 的客户端都可以加入这套聊天系统。
-我主要在 Claude Code/Claude Desktop 下测试；你可以尝试混编团队（Claude + GPT + Gemini 等），前提是你的工具/客户端支持 MCP。
-
-### Token 消耗（更准确的理解）
-工具调用仍会产生输入/输出 token，但因为工具面极小、输出紧凑稳定，
-体验接近"让 AI 写/读落盘 TXT"，甚至在很多场景下更省（少指令、少误调用、少长 SOP）。
-并发本身不等于更少 tokens，但它能降低你的人工迭代成本：更快拿到反馈、更容易复盘追问、上下文更持久专业。
-
-### AI 管理 AI（本工具的特色）
-一个核心思路是"经理管员工"：
-- 经理在公共频道群发指令：`send("all", "001-003 做A；004-006 做B；007-009 待命")`
-- 员工私聊/群发回报进度
-如何分工协作属于提示词/流程设计范畴；Bridge MCP 提供的是稳定、低成本的通信底座。
-
 ## 为什么是 Bridge MCP（产品优势）
 
 Bridge MCP 的设计逻辑是"Agent 24 小时待命听指挥"：
@@ -65,44 +25,96 @@ Agent 可以通过 `recv(86400)` 长时间保持监听，像工作群一样随�
 - **上下线自适应**：心跳维护在线列表，`send("all", ...)` 作用于当前在线快照。
 - **输出可读**：时间戳 + 分组 + 分批，保持输出紧凑易读。
 
-### 运行方式（没有常驻服务器）
+**说明：** 这里的"实时"指轮询式近实时，延迟由轮询间隔等配置与环境决定。
+
+## 三终端验收流程（推荐上手方式）
+
+1）安装：
+```bash
+pip install mcp
+```
+
+2）打开 3 个终端 / 3 个 Agent，每个都注册 Bridge MCP（推荐全局安装）：
+```bash
+claude mcp add bridge --scope=user "python" "C:/ccbridge/bridge.py"
+```
+
+3）在 1号 Agent 和 2号 Agent 里先下达一句话：
+> "你保持持续监听；收到任何信息都立刻回复；回复完立刻恢复监听。"
+
+然后执行：
+```bash
+recv(86400)
+```
+
+4）在 3号 Agent（主管）做群聊测试：
+```bash
+send("all", "测试：所有人回复自己的ID+一句当前状态，然后继续监听。")
+recv(30)
+```
+如果没人回复，就再 `recv(30)` 收一次（部分客户端是轮询近实时）。
+
+5）主管→员工私聊验收（建议做一次）：
+
+主管分别私聊两位员工：
+```bash
+send("001", "把你的一句当前状态汇报给我，然后继续监听。")
+send("002", "把你的一句当前状态汇报给我，然后继续监听。")
+```
+主管 `recv(60)` 收汇报。
+
+一切正常的话——恭喜你，你的 AI 团队诞生了。
+
+## 推荐全局安装（user scope）
+
+因为 Bridge MCP 极轻量（3 个工具、输出紧凑稳定、token 开销很低），通常更建议全局注册：
+```bash
+claude mcp add bridge --scope=user "python" "C:/ccbridge/bridge.py"
+```
+这样所有项目都能直接使用；如需项目级注册，请按 Claude 客户端的 MCP 配置规范来。
+
+## 没有常驻服务器
+
 Bridge MCP 不是后台常驻服务器。
 Claude 在 → MCP server 会被启动并运行；Claude 不在 → 进程停止。
 但消息在 SQLite 里持久化，所以跨会话不会丢。
 
-### 环境要求
+## 消息语义
+
+私信是"阅后即焚"：对方 `recv()` 读到后会删除。
+
+群发/广播通过游标（state 表）去重，不会重复展示。
+
+## 数据库路径（默认 C 盘，可自行修改）
+
+默认：`C:\mcp_msg_pool\bridge_v4.db`
+
+兜底：如果默认目录不可写，会自动使用 `C:\Users\Public\mcp_msg_pool\bridge_v4.db`
+
+改路径：编辑 `bridge.py` 顶部 `PREFERRED_ROOT` / `FALLBACK_ROOT` 即可。
+
+## 混编团队（理论支持）
+
+理论上任何支持 MCP 的客户端都可以加入这套聊天系统。
+我主要在 Claude Code/Claude Desktop 下测试；你可以尝试混编团队（Claude + GPT + Gemini 等），前提是你的工具/客户端支持 MCP。
+
+## Token 消耗（更准确的理解）
+
+工具调用仍会产生输入/输出 token，但因为工具面极小、输出紧凑稳定，
+体验接近"让 AI 写/读落盘 TXT"，并且更利于长期复盘追问。
+并发不等于更少 tokens，但能降低你的人工迭代成本：更快反馈、更好复盘、上下文更持久。
+
+## 环境要求
+
 - Python 3.x
 - `pip install mcp`
 - 支持 MCP 的客户端（Claude Code / Claude Desktop 等）
 - 只要你会配置 MCP server，就能接入使用
 
-### 平台说明
-目前主要在 **Windows** 下测试。
+## 平台说明
+
+目前主要在 Windows 下测试。
 macOS/Linux 理论可用，但需要自行调整路径（编辑 `bridge.py` 的 `PREFERRED_ROOT` / `FALLBACK_ROOT`）。
-
-## 说明
-- `send("all", ...)` 向当前所有在线代理广播（不包括你自己）。
-- 专为单机 / 受控的本地环境设计。
-
-## 数据库路径（默认 C 盘，可自行修改）
-- 默认：`C:\mcp_msg_pool\bridge_v4.db`
-- 兜底：如果默认目录不可写，会自动使用 `C:\Users\Public\mcp_msg_pool\bridge_v4.db`
-- 如需改路径：编辑 `bridge.py` 顶部的 `PREFERRED_ROOT` / `FALLBACK_ROOT` 常量即可。
-
-## 安装范围（按 Claude 规范）
-MCP 注册一般分两种：
-- 全局安装（对所有项目生效）
-- 项目级安装（仅当前项目生效）
-具体以 Claude Code/客户端的 MCP 配置方式为准。
-
-## 没有常驻服务器
-Bridge MCP 不是一直在后台跑的服务。
-Claude 在 → MCP server 会被启动并运行；Claude 不在 → 进程停止。
-但消息保存在 SQLite 里，所以下次启动 Claude 还能继续接收/追问/复盘。
-
-## 消息语义
-- 私信是"阅后即焚"：对方 `recv()` 读到后会删除。
-- 群发/广播通过游标（state 表）去重，不会重复展示。
 
 ## 设计与性能说明（基础版）
 
@@ -140,3 +152,9 @@ Claude 在 → MCP server 会被启动并运行；Claude 不在 → 进程停止
   - 避免把 DB 放在同步/扫描很激进的目录（例如网盘同步目录），
   - 降低并发写入（很多 agent 同时狂发消息），
   - 保持 busy_timeout（代码已设置）。
+
+---
+
+*团队协作场景：建议将 [PROMPT_GLOBAL.md](PROMPT_GLOBAL.md) 复制到你的全局提示词 / CLAUDE.md 中。*
+
+*Powered by Bridge MCP (by vvvykvvv)*
