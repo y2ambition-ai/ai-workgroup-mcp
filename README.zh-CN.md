@@ -13,6 +13,40 @@ pip install mcp
 claude mcp add bridge "python" "C:/ccbridge/bridge.py"
 ```
 
+## 30 秒上手（最小流程）
+1）安装 MCP：
+```bash
+pip install mcp
+```
+2）打开 两个终端/两个 Agent（也可以更多），注册 Bridge MCP：
+```bash
+claude mcp add bridge "python" "C:/ccbridge/bridge.py"
+```
+3）在每个 Agent 里：
+- 先 `get_status()` 看看当前在线有多少人
+- 再 `recv(86400)` 进入待命监听
+
+恭喜你，你的 AI 团队诞生了。
+
+### 上下线与时长
+Agent 在线与否取决于它是否在运行并持续心跳。
+离线超时、私信/群发保留时长等都在 bridge.py 里可配置（按需求改）。
+
+### 混编团队（理论支持）
+理论上任何支持 MCP 的客户端都可以加入这套聊天系统。
+我主要在 Claude Code/Claude Desktop 下测试；你可以尝试混编团队（Claude + GPT + Gemini 等），前提是你的工具/客户端支持 MCP。
+
+### Token 消耗（更准确的理解）
+工具调用仍会产生输入/输出 token，但因为工具面极小、输出紧凑稳定，
+体验接近"让 AI 写/读落盘 TXT"，甚至在很多场景下更省（少指令、少误调用、少长 SOP）。
+并发本身不等于更少 tokens，但它能降低你的人工迭代成本：更快拿到反馈、更容易复盘追问、上下文更持久专业。
+
+### AI 管理 AI（本工具的特色）
+一个核心思路是"经理管员工"：
+- 经理在公共频道群发指令：`send("all", "001-003 做A；004-006 做B；007-009 待命")`
+- 员工私聊/群发回报进度
+如何分工协作属于提示词/流程设计范畴；Bridge MCP 提供的是稳定、低成本的通信底座。
+
 ## 为什么是 Bridge MCP（产品优势）
 
 Bridge MCP 的设计逻辑是"Agent 24 小时待命听指挥"：
