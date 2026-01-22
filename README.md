@@ -20,7 +20,7 @@ agents can stay listening for up to 24 hours via `recv(86400)` and respond like 
 - **Fast responsiveness (config-based)**:
   - cancel latency ≤ `RECV_TICK` (default `0.25s`)
   - message delivery while listening typically ≤ `RECV_DB_POLL_EVERY + RECV_TICK` (default ~ `2.25s`)
-- **Durable & stable by design**: messages persist in SQLite; non-daemon runtime; DB lock contention is mitigated (busy_timeout, WAL, short write windows).
+- **Durable &amp; stable by design**: messages persist in SQLite; non-daemon runtime; DB lock contention is mitigated (busy_timeout, WAL, short write windows).
 - **Highly extensible (DB-as-API)**: external scripts/plugins can write to SQLite to inject data/events/broadcasts without changing the MCP tool surface.
 - **Adaptive online roster**: built-in heartbeats maintain who's online; `send("all", ...)` targets the current online snapshot.
 - **Readable outputs**: timestamps + grouping + batching keep responses compact.
@@ -44,7 +44,7 @@ claude mcp add bridge --scope=user "python" "C:/ccbridge/bridge.py"
 ```
 
 3) In Agent-1 and Agent-2, tell them:
-> "Stay in continuous listening mode. If you receive any message, reply immediately, then return to listening."
+&gt; "Stay in continuous listening mode. If you receive any message, reply immediately, then return to listening."
 
 Then run:
 ```bash
@@ -146,8 +146,8 @@ In practice this reduces "tool-selection overhead" and prompt bloat compared to 
 
 ### Latency expectations (default config in `bridge.py`)
 These are derived from the default constants:
-- **Cancel latency**: &le; `RECV_TICK` (default `0.25s`) — how fast `recv()` reacts to a new command.
-- **Message delivery while listening**: typically &le; `RECV_DB_POLL_EVERY + RECV_TICK` (default `2.0s + 0.25s &asymp; 2.25s`).
+- **Cancel latency**: &amp;le; `RECV_TICK` (default `0.25s`) — how fast `recv()` reacts to a new command.
+- **Message delivery while listening**: typically &amp;le; `RECV_DB_POLL_EVERY + RECV_TICK` (default `2.0s + 0.25s &amp;asymp; 2.25s`).
 - **Maintenance**: every `RECV_MAINT_EVERY` (default `10s`) for heartbeat/cleanup.
 - **Batching**: long outputs are split by `MAX_BATCH_SIZE` (default `5000` chars).
 
@@ -171,7 +171,7 @@ Edit these constants in `bridge.py`:
 
 ---
 
-**More examples:** [PLAYBOOK.md](PLAYBOOK.md) / [PLAYBOOK.zh-CN.md](PLAYBOOK.zh-CN.md)
+**More examples:** [PLAYBOOK.md](PLAYBOOK.md) / [PLAYBOOK.zh-CN.md](PLAYBOOK.zh-CN.md) *(now with Recipe 10: Rapid-fire workflow / 口喷工作流)*
 
 *For team workflows, copy [PROMPT_GLOBAL.md](PROMPT_GLOBAL.md) into your global prompt / CLAUDE.md.*
 
