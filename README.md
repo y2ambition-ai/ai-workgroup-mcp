@@ -13,6 +13,40 @@ pip install mcp
 claude mcp add bridge "python" "C:/ccbridge/bridge.py"
 ```
 
+## Getting started in 30 seconds
+1) Install MCP:
+```bash
+pip install mcp
+```
+2) Open two terminals / two agents (or more) and register Bridge MCP:
+```bash
+claude mcp add bridge "python" "C:/ccbridge/bridge.py"
+```
+3) In each agent, run:
+- `get_status()` to see how many peers are online.
+- `recv(86400)` to keep the agent "on standby".
+
+Congrats — your AI team is born.
+
+### Online/offline behavior
+Agents appear "online" while they are running and sending heartbeats.
+Offline timeout and message TTLs are configurable in bridge.py (adjust to your needs).
+
+### Mixed teams (in theory)
+In theory, any MCP-capable client can join this chat system.
+I primarily tested on Claude Code/Claude Desktop; you can try building a mixed team (Claude + GPT + Gemini, etc.) if your clients support MCP.
+
+### Token cost (practical note)
+Tool calls still produce input/output tokens, but the tool surface is tiny and outputs are compact.
+This feels close to agents writing/reading a local TXT file — but with durable, queryable, long-term context.
+Parallelism doesn't "reduce model tokens", but it can reduce your human iteration cost by enabling faster feedback + postmortems.
+
+### AI-manages-AI (core idea)
+A key pattern is "one manager agent coordinates many workers":
+- manager broadcasts: `send("all", "001-003 do X; 004-006 do Y; 007-009 standby")`
+- workers report back via DM or broadcast
+This is prompt/workflow-driven — Bridge MCP provides the stable communication layer.
+
 ## Why Bridge MCP (advantages)
 
 Bridge MCP is built for an **agents-on-standby** workflow:
