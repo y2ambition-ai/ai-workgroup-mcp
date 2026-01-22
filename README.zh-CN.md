@@ -159,4 +159,14 @@ macOS/Linux 理论可用，但需要自行调整路径（编辑 `bridge.py` 的 
 
 *团队协作场景：建议将 [PROMPT_GLOBAL.md](PROMPT_GLOBAL.md) 复制到你的全局提示词 / CLAUDE.md 中。*
 
+## 联系与维护说明
+
+**联系方式：** 微信 `vvvykvvv` | 邮箱 `84927052@qq.com`
+
+**维护说明：** 我不是程序员，也不会 GitHub；这个仓库是我个人工作流用的，基本都由 AI 操作维护。  
+**有问题请优先在 GitHub Issues/Discussions 提交**，我会让 AI 定期阅读和整理。  
+以上联系方式仅用于必要情况（减少垃圾信息）。
+
+---
+
 *Powered by Bridge MCP (by vvvykvvv)*
