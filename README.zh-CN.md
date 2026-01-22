@@ -155,6 +155,8 @@ macOS/Linux 理论可用，但需要自行调整路径（编辑 `bridge.py` 的 
 
 ---
 
+**更多玩法示例：** [PLAYBOOK.zh-CN.md](PLAYBOOK.zh-CN.md) / [PLAYBOOK.md](PLAYBOOK.md)
+
 *团队协作场景：建议将 [PROMPT_GLOBAL.md](PROMPT_GLOBAL.md) 复制到你的全局提示词 / CLAUDE.md 中。*
 
 *Powered by Bridge MCP (by vvvykvvv)*
