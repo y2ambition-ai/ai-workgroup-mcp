@@ -20,3 +20,7 @@ to inject messages, events, or broadcasts without adding new MCP tools.
 The database path defaults to `C:\mcp_msg_pool\bridge_v4.db` (Windows).
 
 Do not expose the database file to untrusted networks or users.
+
+## Design Note
+
+**External producers are where semantic routing/auto-dispatch logic lives.**
