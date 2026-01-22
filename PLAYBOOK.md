@@ -13,6 +13,8 @@ claude mcp add bridge --scope=user "python" "C:/ccbridge/bridge.py"
 2. **Workers stay on standby**: they run `recv(86400)`, reply fast, and return to listening.
 3. **Keep outputs short + structured**: one-line status updates, numbered bullet results, and short follow-ups.
 
+**Note:** Agent IDs are randomly assigned. Always run `get_status()` first and use the actual IDs shown there.
+
 ## Recipe 1 — CEO + Workers (classic "delegate & report")
 **Goal:** manager assigns tasks; workers reply; manager summarizes.
 
@@ -38,8 +40,8 @@ get_status()
 
 2) Assign tasks (DM or broadcast):
 ```bash
-send("001", "Task: Research option A. Reply: steps + tradeoffs + recommendation. Then keep listening.")
-send("002", "Task: Research option B. Reply: risks + cost + timeline. Then keep listening.")
+send("<WORKER_1_ID>", "Task: Research option A. Reply: steps + tradeoffs + recommendation. Then keep listening.")
+send("<WORKER_2_ID>", "Task: Research option B. Reply: risks + cost + timeline. Then keep listening.")
 ```
 
 3) Collect reports:
@@ -108,7 +110,7 @@ Auditor always asks: assumptions, edge cases, failure modes, minimal reproductio
 
 ### CEO flow
 ```bash
-send("QA_ID", "Audit Worker-1 output. Provide: 5 risks + 5 fixes + final verdict.")
+send("<QA_ID>", "Audit Worker-1 output. Provide: 5 risks + 5 fixes + final verdict.")
 recv(120)
 ```
 
@@ -117,7 +119,7 @@ recv(120)
 
 ### Example command:
 ```bash
-send("all", "001-003 do research; 004-006 draft; 007-009 standby. Reply only with your ID + 1-line status.")
+send("all", "<001-003> do research; <004-006> draft; <007-009> standby. Reply only with your ID + 1-line status.")
 ```
 
 **Note:** It's prompt-driven. Bridge MCP provides the communication layer.
