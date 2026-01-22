@@ -36,3 +36,40 @@ Messages remain in SQLite, so nothing is lost between sessions.
 ## Message semantics
 - Direct messages are "consume-on-read": once received via `recv()`, they are deleted.
 - Broadcast uses a cursor (state table) to avoid repeats.
+
+## Design &amp; performance (practical)
+
+### Design logic
+- **Local-first, zero infra**: one MCP server + one SQLite file (durable message bus).
+- **DB-as-API**: external scripts *can* write into the same SQLite DB to produce messages/broadcasts without adding new MCP tools.
+- **Stable 3-tool surface**: fewer tool mistakes, easier prompting and long-term usage.
+- **Non-daemon**: this is not a background service. It runs only when your Claude client starts it; when Claude exits, it stops. Messages remain in SQLite.
+
+### Token cost (what "low token" means here)
+Tool calls still use tokens for inputs/outputs, but the **protocol surface is tiny (3 tools)** and the outputs are stable/compact.
+In practice this reduces "tool-selection overhead" and prompt bloat compared to larger tool suites.
+
+### Latency expectations (default config in `bridge.py`)
+These are derived from the default constants:
+- **Cancel latency**: &le; `RECV_TICK` (default `0.25s`) — how fast `recv()` reacts to a new command.
+- **Message delivery while listening**: typically &le; `RECV_DB_POLL_EVERY + RECV_TICK` (default `2.0s + 0.25s &asymp; 2.25s`).
+- **Maintenance**: every `RECV_MAINT_EVERY` (default `10s`) for heartbeat/cleanup.
+- **Batching**: long outputs are split by `MAX_BATCH_SIZE` (default `5000` chars).
+
+Real-world latency depends on disk speed, number of agents, and your client's concurrency model.
+
+### Tuning knobs (safe to tweak)
+Edit these constants in `bridge.py`:
+- `RECV_TICK` (cancel responsiveness)
+- `RECV_DB_POLL_EVERY` (receive latency vs DB load)
+- `RECV_MAINT_EVERY` (heartbeat/cleanup frequency)
+- TTLs: `HEARTBEAT_TTL`, `BROADCAST_TTL`, `DIRECT_MSG_TTL`
+
+### Debugging checklist
+- **Confirm DB path**: see "Database path" section above; check the file exists.
+- **Logs**: Bridge prints `[BRIDGE] ...` logs to stderr. Run `python bridge.py` manually to see startup/log output when debugging.
+- **If you see `DB Busy/Locked`**:
+  - close any SQLite viewer holding the file,
+  - avoid placing the DB under aggressive sync/scan folders (e.g., cloud sync),
+  - reduce simultaneous writers (many agents spamming `send`),
+  - keep `busy_timeout` enabled (already set in code).
