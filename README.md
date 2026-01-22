@@ -13,6 +13,38 @@ pip install mcp
 claude mcp add bridge "python" "C:/ccbridge/bridge.py"
 ```
 
+## Why Bridge MCP (advantages)
+
+Bridge MCP is built for an **agents-on-standby** workflow:
+agents can stay listening for up to 24 hours via `recv(86400)` and respond like a real workgroup.
+
+### What you get
+- **Workgroup-style, not mailbox-style**: near-real-time messaging while agents are listening (not "send email and wait").
+- **Ultra-light deployment**: essentially **one MCP server + one SQLite file** (no Redis, no extra web service).
+- **Single-file friendly**: the core server is a small Python script; easy to copy, version, and run.
+- **Low learning cost for AI**: only **3 tools** with stable outputs → minimal prompt bloat and fewer tool mistakes.
+- **Fast responsiveness (config-based)**:
+  - cancel latency ≤ `RECV_TICK` (default `0.25s`)
+  - message delivery while listening typically ≤ `RECV_DB_POLL_EVERY + RECV_TICK` (default ~ `2.25s`)
+- **Durable & stable by design**: messages persist in SQLite; the system is non-daemon; DB lock contention is mitigated (busy_timeout, WAL, short write windows).
+- **Highly extensible (DB-as-API)**: external scripts/plugins can write to SQLite to inject data/events/broadcasts without changing the MCP tool surface.
+- **Adaptive online roster**: built-in heartbeats maintain who's online; `send("all", ...)` targets the current online snapshot.
+- **Readable outputs**: timestamps + grouping + batching keep responses compact.
+
+### Runtime model (no always-on server)
+Bridge MCP is **not** a resident background service.
+It runs only when your Claude client starts the MCP server. When Claude exits, it stops.
+Messages remain in SQLite, so nothing is lost between sessions.
+
+### Requirements
+- Python 3.x
+- `pip install mcp`
+- An MCP-capable client (Claude Code / Claude Desktop / etc.)
+
+### Platform notes
+Tested primarily on **Windows**.
+On macOS/Linux, it should work with minor path adjustments (edit `PREFERRED_ROOT` / `FALLBACK_ROOT` in `bridge.py`).
+
 ## Notes
 - `send("all", ...)` broadcasts to currently online peers (excluding yourself).
 - Designed for single-machine / controlled local environments.
