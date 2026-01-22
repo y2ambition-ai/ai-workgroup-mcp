@@ -158,4 +158,14 @@ Edit these constants in `bridge.py`:
 
 *For team workflows, copy [PROMPT_GLOBAL.md](PROMPT_GLOBAL.md) into your global prompt / CLAUDE.md.*
 
+## Contact / Maintainer note
+
+**Contact:** WeChat `vvvykvvv` | Email `84927052@qq.com`
+
+**Maintainer note:** I'm not a programmer; this repo is built for my personal workflow and most changes are done with AI assistance.  
+**Please use GitHub Issues/Discussions for feedback** — I will ask AI to review and summarize periodically.  
+Contact info above is for urgent matters only (to reduce spam).
+
+---
+
 *Powered by Bridge MCP (by vvvykvvv)*
