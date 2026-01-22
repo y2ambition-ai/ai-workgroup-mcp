@@ -154,6 +154,8 @@ Edit these constants in `bridge.py`:
 
 ---
 
+**More examples:** [PLAYBOOK.md](PLAYBOOK.md) / [PLAYBOOK.zh-CN.md](PLAYBOOK.zh-CN.md)
+
 *For team workflows, copy [PROMPT_GLOBAL.md](PROMPT_GLOBAL.md) into your global prompt / CLAUDE.md.*
 
 *Powered by Bridge MCP (by vvvykvvv)*
