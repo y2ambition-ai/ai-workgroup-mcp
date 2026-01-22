@@ -27,6 +27,10 @@ agents can stay listening for up to 24 hours via `recv(86400)` and respond like 
 
 *Note:* "Real-time" here is **near-real-time** (poll-based). Actual latency depends on polling config and environment.
 
+### Semantic-adaptive API (concept)
+Bridge MCP is the lightweight workgroup bus. For "semantic routing" (sending the right task to the right agent),
+build a small external Python producer that reads external data, decides recipients, and writes messages into SQLite (broadcast/DM).
+
 ## 3-terminal onboarding (recommended)
 
 1) Install:
@@ -56,10 +60,12 @@ If nobody replies, call `recv(30)` again (some clients are polling-based).
 
 5) Manager workflow test (recommended):
 
+**Run `get_status()` first and use the actual worker IDs shown there.**
+
 From Agent-3 (as manager), DM each worker:
 ```bash
-send("001", "Reply with a one-line status to the manager, then keep listening.")
-send("002", "Reply with a one-line status to the manager, then keep listening.")
+send("<WORKER_1_ID>", "Reply with a one-line status to the manager, then keep listening.")
+send("<WORKER_2_ID>", "Reply with a one-line status to the manager, then keep listening.")
 ```
 Collect replies via `recv(60)`.
 
@@ -103,6 +109,17 @@ I primarily tested on Claude Code/Claude Desktop; you can try building a mixed t
 Tool calls still use input/output tokens, but the tool surface is tiny and outputs are compact.
 This feels close to agents writing/reading a local TXT file — but with durable, queryable, long-term context.
 Parallel work doesn't magically reduce model tokens, but it can reduce human iteration cost by enabling faster feedback and easier postmortems.
+
+## Scaling note
+
+Bridge MCP keeps the **communication layer lightweight**: adding more agents doesn't inherently "block" messaging.
+In practice, scaling is mostly limited by:
+- **your model token budget** (more agents = more parallel outputs),
+- **your machine resources** (CPU/disk),
+- and **the storage backend** (SQLite is great for small/medium local teams).
+
+If you want a much larger team or heavier concurrency, consider upgrading the backend beyond SQLite
+(e.g., Postgres/Redis/message queue) and tune polling parameters (`RECV_DB_POLL_EVERY`, `RECV_TICK`).
 
 ## Requirements
 
