@@ -7,46 +7,6 @@ A tiny MCP server that turns a single SQLite file into a durable message bus for
 - `send(to, content)` — DM / multicast / `all` broadcast to online peers
 - `recv(wait_seconds=86400)` — receive messages (virtual blocking)
 
-## Quickstart
-```bash
-pip install mcp
-claude mcp add bridge "python" "C:/ccbridge/bridge.py"
-```
-
-## Getting started in 30 seconds
-1) Install MCP:
-```bash
-pip install mcp
-```
-2) Open two terminals / two agents (or more) and register Bridge MCP:
-```bash
-claude mcp add bridge "python" "C:/ccbridge/bridge.py"
-```
-3) In each agent, run:
-- `get_status()` to see how many peers are online.
-- `recv(86400)` to keep the agent "on standby".
-
-Congrats — your AI team is born.
-
-### Online/offline behavior
-Agents appear "online" while they are running and sending heartbeats.
-Offline timeout and message TTLs are configurable in bridge.py (adjust to your needs).
-
-### Mixed teams (in theory)
-In theory, any MCP-capable client can join this chat system.
-I primarily tested on Claude Code/Claude Desktop; you can try building a mixed team (Claude + GPT + Gemini, etc.) if your clients support MCP.
-
-### Token cost (practical note)
-Tool calls still produce input/output tokens, but the tool surface is tiny and outputs are compact.
-This feels close to agents writing/reading a local TXT file — but with durable, queryable, long-term context.
-Parallelism doesn't "reduce model tokens", but it can reduce your human iteration cost by enabling faster feedback + postmortems.
-
-### AI-manages-AI (core idea)
-A key pattern is "one manager agent coordinates many workers":
-- manager broadcasts: `send("all", "001-003 do X; 004-006 do Y; 007-009 standby")`
-- workers report back via DM or broadcast
-This is prompt/workflow-driven — Bridge MCP provides the stable communication layer.
-
 ## Why Bridge MCP (advantages)
 
 Bridge MCP is built for an **agents-on-standby** workflow:
@@ -60,48 +20,100 @@ agents can stay listening for up to 24 hours via `recv(86400)` and respond like 
 - **Fast responsiveness (config-based)**:
   - cancel latency ≤ `RECV_TICK` (default `0.25s`)
   - message delivery while listening typically ≤ `RECV_DB_POLL_EVERY + RECV_TICK` (default ~ `2.25s`)
-- **Durable & stable by design**: messages persist in SQLite; the system is non-daemon; DB lock contention is mitigated (busy_timeout, WAL, short write windows).
+- **Durable & stable by design**: messages persist in SQLite; non-daemon runtime; DB lock contention is mitigated (busy_timeout, WAL, short write windows).
 - **Highly extensible (DB-as-API)**: external scripts/plugins can write to SQLite to inject data/events/broadcasts without changing the MCP tool surface.
 - **Adaptive online roster**: built-in heartbeats maintain who's online; `send("all", ...)` targets the current online snapshot.
 - **Readable outputs**: timestamps + grouping + batching keep responses compact.
 
-### Runtime model (no always-on server)
-Bridge MCP is **not** a resident background service.
-It runs only when your Claude client starts the MCP server. When Claude exits, it stops.
-Messages remain in SQLite, so nothing is lost between sessions.
+*Note:* "Real-time" here is **near-real-time** (poll-based). Actual latency depends on polling config and environment.
 
-### Requirements
-- Python 3.x
-- `pip install mcp`
-- An MCP-capable client (Claude Code / Claude Desktop / etc.)
+## 3-terminal onboarding (recommended)
 
-### Platform notes
-Tested primarily on **Windows**.
-On macOS/Linux, it should work with minor path adjustments (edit `PREFERRED_ROOT` / `FALLBACK_ROOT` in `bridge.py`).
+1) Install:
+```bash
+pip install mcp
+```
 
-## Notes
-- `send("all", ...)` broadcasts to currently online peers (excluding yourself).
-- Designed for single-machine / controlled local environments.
+2) Open 3 terminals / 3 agents and register Bridge MCP in each (recommended global install):
+```bash
+claude mcp add bridge --scope=user "python" "C:/ccbridge/bridge.py"
+```
 
-## Database path
-- Default: `C:\mcp_msg_pool\bridge_v4.db` (Windows)
-- Fallback (if not writable): `C:\Users\Public\mcp_msg_pool\bridge_v4.db`
-- You can change the location by editing `PREFERRED_ROOT` / `FALLBACK_ROOT` constants in `bridge.py`.
+3) In Agent-1 and Agent-2, tell them:
+> "Stay in continuous listening mode. If you receive any message, reply immediately, then return to listening."
 
-## Install scope (Claude conventions)
-You can register MCP either:
-- Globally (available to all projects), or
-- Per-project (only for the current workspace),
-depending on how your Claude client configures MCP servers.
+Then run:
+```bash
+recv(86400)
+```
 
-## No always-on server
+4) In Agent-3, run a broadcast test:
+```bash
+send("all", "Test: everyone reply with your ID and a one-line status, then go back to listening.")
+recv(30)
+```
+If nobody replies, call `recv(30)` again (some clients are polling-based).
+
+5) Manager workflow test (recommended):
+
+From Agent-3 (as manager), DM each worker:
+```bash
+send("001", "Reply with a one-line status to the manager, then keep listening.")
+send("002", "Reply with a one-line status to the manager, then keep listening.")
+```
+Collect replies via `recv(60)`.
+
+If all checks pass — congrats, your AI team is born.
+
+## Recommended install scope
+
+Because Bridge MCP is extremely lightweight (3 tools, compact outputs), it's typically best to register it globally:
+```bash
+claude mcp add bridge --scope=user "python" "C:/ccbridge/bridge.py"
+```
+If you prefer per-project registration, follow your Claude client's MCP configuration conventions.
+
+## No always-on server (non-daemon)
+
 Bridge MCP is not a resident background service.
 It runs only when your Claude client starts the MCP server. When Claude exits, it stops.
 Messages remain in SQLite, so nothing is lost between sessions.
 
 ## Message semantics
-- Direct messages are "consume-on-read": once received via `recv()`, they are deleted.
-- Broadcast uses a cursor (state table) to avoid repeats.
+
+Direct messages are "consume-on-read": once received via `recv()`, they are deleted.
+
+Broadcast uses a cursor (state table) to avoid repeats.
+
+## Database path
+
+Default: `C:\mcp_msg_pool\bridge_v4.db` (Windows)
+
+Fallback (if not writable): `C:\Users\Public\mcp_msg_pool\bridge_v4.db`
+
+Change by editing `PREFERRED_ROOT` / `FALLBACK_ROOT` in `bridge.py`.
+
+## Mixed teams (in theory)
+
+In theory, any MCP-capable client can join this chat system.
+I primarily tested on Claude Code/Claude Desktop; you can try building a mixed team (Claude + GPT + Gemini, etc.) if your clients support MCP.
+
+## Token cost (practical note)
+
+Tool calls still use input/output tokens, but the tool surface is tiny and outputs are compact.
+This feels close to agents writing/reading a local TXT file — but with durable, queryable, long-term context.
+Parallel work doesn't magically reduce model tokens, but it can reduce human iteration cost by enabling faster feedback and easier postmortems.
+
+## Requirements
+
+- Python 3.x
+- `pip install mcp`
+- An MCP-capable client (Claude Code / Claude Desktop / etc.)
+
+## Platform notes
+
+Tested primarily on Windows.
+On macOS/Linux, it should work with minor path adjustments (edit `PREFERRED_ROOT` / `FALLBACK_ROOT`).
 
 ## Design &amp; performance (practical)
 
@@ -139,3 +151,9 @@ Edit these constants in `bridge.py`:
   - avoid placing the DB under aggressive sync/scan folders (e.g., cloud sync),
   - reduce simultaneous writers (many agents spamming `send`),
   - keep `busy_timeout` enabled (already set in code).
+
+---
+
+*For team workflows, copy [PROMPT_GLOBAL.md](PROMPT_GLOBAL.md) into your global prompt / CLAUDE.md.*
+
+*Powered by Bridge MCP (by vvvykvvv)*
