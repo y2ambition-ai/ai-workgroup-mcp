@@ -15,7 +15,7 @@ claude mcp add bridge --scope=user "python" "C:/ccbridge/bridge.py"
 
 **Note:** Agent IDs are randomly assigned. Always run `get_status()` first and use the actual IDs shown there.
 
-## Recipe 1 — CEO + Workers (classic "delegate & report")
+## Recipe 1 — CEO + Workers (classic "delegate &amp; report")
 **Goal:** manager assigns tasks; workers reply; manager summarizes.
 
 ### Setup
@@ -25,7 +25,7 @@ claude mcp add bridge --scope=user "python" "C:/ccbridge/bridge.py"
 
 ### Worker instruction (copy/paste)
 Tell Worker-1 and Worker-2:
-> "Stay in continuous listening mode. If you receive a message, reply immediately with a concise answer, then return to listening."
+&gt; "Stay in continuous listening mode. If you receive a message, reply immediately with a concise answer, then return to listening."
 
 Then on each worker run:
 ```bash
@@ -49,7 +49,7 @@ send("<WORKER_2_ID>", "Task: Research option B. Reply: risks + cost + timeline. 
 recv(120)
 ```
 
-4) Summarize & decide: CEO writes a final summary and next steps.
+4) Summarize &amp; decide: CEO writes a final summary and next steps.
 
 **Expected outcome:** workers answer quickly; CEO stays in control.
 
@@ -97,7 +97,7 @@ recv(90)
 ### Follow-up
 CEO picks one approach and asks 1 worker to deep-dive, 1 worker to critique, 1 worker to produce a checklist.
 
-## Recipe 5 — Auditor agent (postmortem & correctness)
+## Recipe 5 — Auditor agent (postmortem &amp; correctness)
 **Goal:** keep quality high over long iterations.
 
 ### Roles
@@ -146,6 +146,41 @@ Example: run a cooperative "tile game" simulation (no money/gambling).
 - Host enforces rules and maintains state
 
 This is a fun way to test concurrency and message clarity.
+
+## Recipe 10 — "Rapid-fire workflow" (口喷工作流): brainstorm → swap → debug fast
+**Goal:** rapid iteration with minimal overhead. You can replace workflows on the fly by bringing agents online/offline.
+
+### Core idea
+- One manager agent "talks it out" (brainstorming) while continuously shaping the workflow.
+- Workers can be swapped by simply starting/stopping their terminals.
+- A single agent can own **one responsibility** or **multiple responsibilities**.
+  - For "non-compliant" agents, the simplest approach is to assign multiple tasks **serially** in one message.
+
+### Why it works well here
+- Bridge MCP is chat-like (near-real-time), not mailbox-like.
+- You can quickly ask: "Why did you do it this way?" and iterate immediately.
+- Parallel work doesn't magically reduce model tokens, but it reduces your **human iteration cost**:
+  faster feedback, faster debugging, better postmortems.
+
+### Minimal protocol
+**Manager broadcast:**
+- `send("all", "Rapid-fire mode: reply with ID + 1-line status. Then stay listening.")`
+
+**Task assignment (serial or parallel):**
+- Serial (one agent owns multiple steps):
+  - `send("<WORKER_ID>", "Do A then B then C. After each step, send 1-line progress. Then keep listening.")`
+- Parallel (specialists):
+  - `send("<WORKER_1_ID>", "Own A only. Reply quickly. Then keep listening.")`
+  - `send("<WORKER_2_ID>", "Own B only. Reply quickly. Then keep listening.")`
+
+**Manager collects:**
+- `recv(60)` (repeat if needed)
+
+### Swap workflow on the fly
+If a workflow is wrong, you don't "refactor a system" — you just:
+- change the manager instruction,
+- stop/start different worker terminals,
+- re-assign tasks.
 
 ## Troubleshooting (common)
 - **If nobody replies after broadcast:** call `recv(30)` again (polling near-real-time).
