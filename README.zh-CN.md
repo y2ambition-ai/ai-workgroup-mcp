@@ -13,6 +13,39 @@ pip install mcp
 claude mcp add bridge "python" "C:/ccbridge/bridge.py"
 ```
 
+## 为什么是 Bridge MCP（产品优势）
+
+Bridge MCP 的设计逻辑是"Agent 24 小时待命听指挥"：
+Agent 可以通过 `recv(86400)` 长时间保持监听，像工作群一样随时接收指令与汇报，而不是"发邮件等回复"。
+
+### 你会得到什么
+- **工作群式通信，而不是邮箱式**：只要 Agent 在监听，就能近实时收到消息（不是"发一封信等对方查收"）。
+- **部署极轻量**：基本就是 **一个 MCP + 一个 SQLite 文件**（不需要 Redis、不需要额外 Web 服务）。
+- **单文件友好**：核心就是一个 Python 脚本，易复制、易版本管理、易迁移。
+- **AI 学习成本≈0**：只需要 3 个工具，输出格式稳定 → 提示词更短、误调用更少。
+- **响应很快（由配置常量决定）**：
+  - 取消等待响应 ≤ `RECV_TICK`（默认 `0.25s`）
+  - 监听状态下收到消息通常 ≤ `RECV_DB_POLL_EVERY + RECV_TICK`（默认约 `2.25s`）
+- **稳定性取向**：消息持久化在 SQLite；不是常驻服务；并通过 busy_timeout、WAL、缩短写事务窗口等方式降低锁竞争。
+- **扩展性强（DB 即 API）**：外置脚本/插件可直接写入 SQLite 注入数据/事件/广播，无需新增 MCP 工具。
+- **上下线自适应**：心跳维护在线列表，`send("all", ...)` 作用于当前在线快照。
+- **输出可读**：时间戳 + 分组 + 分批，保持输出紧凑易读。
+
+### 运行方式（没有常驻服务器）
+Bridge MCP 不是后台常驻服务器。
+Claude 在 → MCP server 会被启动并运行；Claude 不在 → 进程停止。
+但消息在 SQLite 里持久化，所以跨会话不会丢。
+
+### 环境要求
+- Python 3.x
+- `pip install mcp`
+- 支持 MCP 的客户端（Claude Code / Claude Desktop 等）
+- 只要你会配置 MCP server，就能接入使用
+
+### 平台说明
+目前主要在 **Windows** 下测试。
+macOS/Linux 理论可用，但需要自行调整路径（编辑 `bridge.py` 的 `PREFERRED_ROOT` / `FALLBACK_ROOT`）。
+
 ## 说明
 - `send("all", ...)` 向当前所有在线代理广播（不包括你自己）。
 - 专为单机 / 受控的本地环境设计。
