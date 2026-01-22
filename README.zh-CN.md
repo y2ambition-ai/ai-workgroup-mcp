@@ -43,7 +43,7 @@ claude mcp add bridge --scope=user "python" "C:/ccbridge/bridge.py"
 ```
 
 3）在 1号 Agent 和 2号 Agent 里先下达一句话：
-> "你保持持续监听；收到任何信息都立刻回复；回复完立刻恢复监听。"
+&gt; "你保持持续监听；收到任何信息都立刻回复；回复完立刻恢复监听。"
 
 然后执行：
 ```bash
@@ -171,7 +171,7 @@ macOS/Linux 理论可用，但需要自行调整路径（编辑 `bridge.py` 的 
 
 ---
 
-**更多玩法示例：** [PLAYBOOK.zh-CN.md](PLAYBOOK.zh-CN.md) / [PLAYBOOK.md](PLAYBOOK.md)
+**更多玩法示例：** [PLAYBOOK.zh-CN.md](PLAYBOOK.zh-CN.md) / [PLAYBOOK.md](PLAYBOOK.md) *(已新增：玩法10「口喷工作流」)*
 
 *团队协作场景：建议将 [PROMPT_GLOBAL.md](PROMPT_GLOBAL.md) 复制到你的全局提示词 / CLAUDE.md 中。*
 
