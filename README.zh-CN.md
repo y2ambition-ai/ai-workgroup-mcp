@@ -4,7 +4,7 @@
 **只有 3 个工具：** `get_status()` / `send(to, content)` / `recv(wait_seconds)`
 不需要额外服务器（不需要 Redis / Web 服务），像"AI 微信工作群"一样组织协作。
 
-**引擎版本：** v9_stable（后台心跳 + PID 清理 + Lease 收件）
+**引擎版本：** v9_stable（后台心跳 + PID 清理 + Lease 收件） | **发布版本：** [v9.0.0](https://github.com/y2ambition-ai/ai-workgroup-mcp/releases/tag/v9.0.0)
 **技术细节：** `docs/ENGINE_v9_STABLE.md`
 
 快速入口：`PLAYBOOK.zh-CN.md` | `PLAYBOOK.md` | `PROMPT_GLOBAL.md` | `examples/` | `docs/ENGINE_v9_STABLE.md`

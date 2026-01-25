@@ -4,7 +4,7 @@ A **local-first** SQLite message bus for multi-agent collaboration.
 **Only 3 tools:** `get_status()` / `send(to, content)` / `recv(wait_seconds)`
 Zero extra infra (no Redis / no web server). Works like an "AI workgroup chat".
 
-**Engine:** v9_stable (background heartbeat + PID janitor + lease-based receive)
+**Engine:** v9_stable (background heartbeat + PID janitor + lease-based receive) | **Release:** [v9.0.0](https://github.com/y2ambition-ai/ai-workgroup-mcp/releases/tag/v9.0.0)
 Technical details: `docs/ENGINE_v9_STABLE.md`
 
 Quick links: `PLAYBOOK.md` | `PLAYBOOK.zh-CN.md` | `PROMPT_GLOBAL.md` | `examples/` | `docs/ENGINE_v9_STABLE.md`
