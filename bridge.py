@@ -1,89 +1,81 @@
-import os, sys, time, io, uuid, sqlite3, random, asyncio
+import os, sys, time, io, uuid, sqlite3, random, asyncio, platform, threading, atexit, signal
 from pathlib import Path
-from mcp.server.fastmcp import FastMCP
 from contextlib import contextmanager
 from collections import defaultdict
+from mcp.server.fastmcp import FastMCP
 
-# --- 1. 基础配置 ---
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+# =========================================================
+# RootBridge - Stable Edition
+# Goals:
+# 1) Background heartbeat (auto online)
+# 2) Safe local janitor (same host + same cwd + PID check)
+# 3) Remote offline via TTL
+# 4) Lease-based recv batching (no duplicates; unread won't be deleted)
+# 5) Simple MCP tools: get_status / send / recv
+# =========================================================
+
+# --- 1) Basic IO (Windows UTF-8) ---
+try:
+    if sys.platform == "win32":
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+except Exception:
+    pass
+
 mcp = FastMCP("RootBridge")
 
-# --- 2. 策略配置 ---
-HEARTBEAT_TTL = 300       # 5分钟掉线
-BROADCAST_TTL = 1800      # 广播保留30分钟
-DIRECT_MSG_TTL = 86400    # 私信保留24小时
-MAINTENANCE_INTERVAL = 10 # 10秒维护一次
-MAX_BATCH_SIZE = 5000     # 单批最大字符数
-
-# recv 调度（不改变工具用法，只降低阻塞/锁竞争/CPU）
-RECV_TICK = 0.25          # 取消响应速度（越小越"灵敏"）
-RECV_DB_POLL_EVERY = 2.0  # 查消息频率
-RECV_MAINT_EVERY = 10.0   # 心跳/清理频率
-
-# 版本配置（重要：更新 schema 时必须修改此版本号！）
-BRIDGE_DB_VERSION = "v4"
+# --- 2) Config ---
+BRIDGE_DB_VERSION = "v9_stable"
 BRIDGE_DB_FILENAME = f"bridge_{BRIDGE_DB_VERSION}.db"
 
-# 路径配置
-PREFERRED_ROOT = Path("C:/mcp_msg_pool")
-FALLBACK_ROOT = Path("C:/Users/Public/mcp_msg_pool")
+if sys.platform == "win32":
+    PREFERRED_ROOT = Path("C:/mcp_msg_pool")
+    FALLBACK_ROOT = Path("C:/Users/Public/mcp_msg_pool")
+else:
+    PREFERRED_ROOT = Path.home() / ".mcp_msg_pool"
+    FALLBACK_ROOT = Path("/tmp/mcp_msg_pool")
 
-# 全局变量
+HEARTBEAT_TTL = 300          # seconds: remote peers expire by time
+MSG_TTL = 86400              # seconds: message retention
+LEASE_TTL = 30               # seconds: inflight lease expiry
+MAX_BATCH_CHARS = 5000       # message batch cap (approx)
+
+RECV_TICK = 0.5              # asyncio sleep tick
+RECV_DB_POLL_EVERY = 2.0     # poll interval
+HEARTBEAT_INTERVAL = 10.0    # background heartbeat interval
+
+# maintenance cadence
+CLEAN_LOCAL_EVERY = 10.0     # seconds: pid-based local zombie cleanup
+CLEAN_REMOTE_EVERY = 60.0    # seconds: ttl cleanup + message prune + lease recovery
+CHECKPOINT_EVERY = 300.0     # seconds: WAL checkpoint (low frequency)
+
+# --- 3) Global State ---
 SESSION_NAME = None
-SESSION_PID = os.getppid()
-LAST_ACTIVE_TS = 0.0  # 最后一次活跃时间戳（用于自动取消旧任务）
+SESSION_PID = os.getpid()
+SESSION_HOST = platform.node()
+SESSION_CWD = os.getcwd()
+LAST_ACTIVE_TS = 0.0
 
-def log(msg):
+_BG_STARTED = False
+_BG_LOCK = threading.Lock()
+
+def log(msg: str):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] [BRIDGE] {msg}", file=sys.stderr)
 
-# --- 版本检测与池子管理 ---
+def _choose_db_path() -> Path:
+    for root in (PREFERRED_ROOT, FALLBACK_ROOT):
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            probe = root / ".perm_probe"
+            probe.touch()
+            probe.unlink(missing_ok=True)
+            return root / BRIDGE_DB_FILENAME
+        except Exception:
+            continue
+    FALLBACK_ROOT.mkdir(parents=True, exist_ok=True)
+    return FALLBACK_ROOT / BRIDGE_DB_FILENAME
 
-def _cleanup_pool():
-    """删除整个池子目录（版本不匹配时调用）"""
-    import shutil
-    for root in [PREFERRED_ROOT, FALLBACK_ROOT]:
-        if root.exists():
-            try:
-                shutil.rmtree(root)
-                log(f"Cleaned old pool: {root}")
-            except Exception as e:
-                log(f"Cleanup failed: {e}")
-
-def _validate_or_rebuild_pool():
-    """
-    启动时验证数据库版本，不匹配则重建整个池子
-
-    逻辑：
-    1. 检查池子目录是否存在
-    2. 存在 -> 检查数据库文件名是否匹配当前版本
-    3. 不匹配 -> 删除整个池子，让 get_db_path() 重建
-    """
-    for root in [PREFERRED_ROOT, FALLBACK_ROOT]:
-        if root.exists():
-            existing_dbs = list(root.glob("bridge_*.db"))
-            if existing_dbs:
-                # 有数据库文件，检查版本
-                if existing_dbs[0].name != BRIDGE_DB_FILENAME:
-                    log(f"Version mismatch: found {existing_dbs[0].name}, expecting {BRIDGE_DB_FILENAME}")
-                    _cleanup_pool()
-                    break
-
-def get_db_path():
-    # 先验证版本，不匹配则清理旧池子
-    _validate_or_rebuild_pool()
-
-    try:
-        PREFERRED_ROOT.mkdir(parents=True, exist_ok=True)
-        (PREFERRED_ROOT / ".perm").touch(); (PREFERRED_ROOT / ".perm").unlink()
-        return PREFERRED_ROOT / BRIDGE_DB_FILENAME
-    except:
-        FALLBACK_ROOT.mkdir(parents=True, exist_ok=True)
-        return FALLBACK_ROOT / BRIDGE_DB_FILENAME
-
-DB_PATH = get_db_path()
-
-# --- 3. 数据库核心层 ---
+DB_PATH = _choose_db_path()
 
 @contextmanager
 def get_db():
@@ -91,383 +83,658 @@ def get_db():
     try:
         conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000;")
-        yield conn
-    except sqlite3.OperationalError as e:
-        log(f"DB Busy/Locked: {e}")
-        raise
-    except Exception as e:
-        log(f"DB Error: {e}")
-        raise
-    finally:
-        if conn: conn.close()
-
-def init_db():
-    with get_db() as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-
-        # Peers 表 (加 cwd 字段)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS peers (
-                id TEXT PRIMARY KEY,
-                pid INTEGER,
-                last_seen REAL,
-                cwd TEXT
-            )
-        """)
-
-        # Messages 表
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                msg_id TEXT PRIMARY KEY,
-                ts REAL,
-                ts_str TEXT,
-                from_user TEXT,
-                to_user TEXT,
-                content TEXT,
-                is_broadcast INTEGER
-            )
-        """)
-
-        # State 表
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS state (
-                agent_id TEXT PRIMARY KEY,
-                last_broadcast_ts REAL
-            )
-        """)
-        # 索引：减少查询与持锁时间（兼容旧库，幂等）
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_to_user ON messages(to_user, is_broadcast, ts);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_broadcast ON messages(is_broadcast, to_user, ts);")
-
-        conn.commit()
-
-try:
-    init_db()
-except Exception as e:
-    log(f"Init Failed: {e}")
-
-# --- 4. 业务逻辑层 ---
-
-def _generate_id() -> str:
-    """随机生成 3 位数字 ID (001-999)，最多尝试 5000 次"""
-    for _ in range(5000):
-        candidate_id = f"{random.randint(1, 999):03d}"
-        # 检查是否已使用
-        with get_db() as conn:
-            cur = conn.execute("SELECT 1 FROM peers WHERE id = ?", (candidate_id,))
-            if not cur.fetchone():
-                return candidate_id
-    raise RuntimeError("无法生成唯一 ID：所有 ID 都被占用")
-
-def _update_heartbeat(name: str, pid: int):
-    cwd = os.getcwd()
-    with get_db() as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO peers (id, pid, last_seen, cwd)
-            VALUES (?, ?, ?, ?)
-        """, (name, pid, time.time(), cwd))
-        conn.commit()
-
-def get_session():
-    global SESSION_NAME
-    if not SESSION_NAME:
-        SESSION_NAME = _generate_id()
-        _update_heartbeat(SESSION_NAME, SESSION_PID)
-    return SESSION_NAME, SESSION_PID
-
-def _mark_active():
-    """标记当前活跃，用于取消旧任务"""
-    global LAST_ACTIVE_TS
-    LAST_ACTIVE_TS = time.time()
-
-# 启动时自动注册
-_auto_name, _auto_pid = get_session()
-
-def _get_active_peers(my_name: str):
-    limit = time.time() - HEARTBEAT_TTL
-    with get_db() as conn:
-        cursor = conn.execute("SELECT id, cwd FROM peers WHERE last_seen > ? ORDER BY id", (limit,))
-        peers = [{"id": row['id'], "cwd": row['cwd']} for row in cursor.fetchall()]
-    return peers
-
-def _send_db(from_user, to_user, content, is_broadcast):
-    msg_id = uuid.uuid4().hex[:8]
-    ts = time.time()
-    ts_str = time.strftime("%H:%M:%S")
-
-    with get_db() as conn:
-        conn.execute("""
-            INSERT INTO messages (msg_id, ts, ts_str, from_user, to_user, content, is_broadcast)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (msg_id, ts, ts_str, from_user, to_user, content, 1 if is_broadcast else 0))
-        conn.commit()
-    return msg_id
-
-def _collect_db(my_name):
-    """Collect messages for me, then delete direct messages and advance broadcast cursor.
-
-    关键改动（不影响 AI 工具用法）：
-    - 不在热路径里反复设置 WAL
-    - 不再一上来 BEGIN IMMEDIATE 抢写锁（读为主，写尽量短）
-    - 只在确实需要 delete/update 时才开启短写事务
-    """
-    msgs = []
-    conn = None
-
-    try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
-        conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000;")
-
-        # ---- read state (no write lock) ----
-        cur = conn.execute("SELECT last_broadcast_ts FROM state WHERE agent_id = ?", (my_name,))
-        row = cur.fetchone()
-        last_bc_ts = row["last_broadcast_ts"] if row else 0.0
-
-        now = time.time()
-        bc_limit = now - BROADCAST_TTL
-        new_max_bc_ts = last_bc_ts
-
-        # ---- read direct ----
-        direct_rows = conn.execute(
-            """
-            SELECT * FROM messages
-            WHERE to_user = ? AND is_broadcast = 0
-            ORDER BY ts ASC
-            """,
-            (my_name,),
-        ).fetchall()
-
-        direct_ids = []
-        for r in direct_rows:
-            msgs.append(dict(r))
-            direct_ids.append(r["msg_id"])
-
-        # ---- read broadcast ----
-        bc_rows = conn.execute(
-            """
-            SELECT * FROM messages
-            WHERE is_broadcast = 1
-              AND to_user = ?
-              AND from_user != ?
-              AND ts > ?
-              AND ts > ?
-            ORDER BY ts ASC
-            """,
-            (my_name, my_name, last_bc_ts, bc_limit),
-        ).fetchall()
-
-        for r in bc_rows:
-            msgs.append(dict(r))
-            if r["ts"] > new_max_bc_ts:
-                new_max_bc_ts = r["ts"]
-
-        # ---- write only if needed (short window) ----
-        if direct_ids or (new_max_bc_ts > last_bc_ts):
-            conn.execute("BEGIN")
-            if direct_ids:
-                placeholders = ",".join("?" * len(direct_ids))
-                conn.execute(f"DELETE FROM messages WHERE msg_id IN ({placeholders})", direct_ids)
-
-            if new_max_bc_ts > last_bc_ts:
-                conn.execute(
-                    "INSERT OR REPLACE INTO state (agent_id, last_broadcast_ts) VALUES (?, ?)",
-                    (my_name, new_max_bc_ts),
-                )
-            conn.commit()
-
-    except Exception as e:
-        if conn:
-            try:
-                conn.rollback()
-            except:
-                pass
-        log(f"_collect_db error: {e}")
-        raise
+        yield conn
     finally:
         if conn:
             conn.close()
 
-    return msgs
-
-def _maintenance_db(my_name, my_pid):
-    now = time.time()
-    _update_heartbeat(my_name, my_pid)
-
-    if hash(my_name) % 2 == 0:
+def _db_retry(fn, retries: int = 7, base_delay: float = 0.03, max_delay: float = 0.35):
+    for i in range(retries):
         try:
-            with get_db() as conn:
-                conn.execute("DELETE FROM peers WHERE last_seen < ?", (now - HEARTBEAT_TTL,))
-                conn.execute("DELETE FROM messages WHERE is_broadcast = 1 AND ts < ?", (now - BROADCAST_TTL,))
-                conn.execute("DELETE FROM messages WHERE is_broadcast = 0 AND ts < ?", (now - DIRECT_MSG_TTL,))
-                conn.commit()
-        except Exception as e:
-            log(f"Maintenance error: {e}")
+            return fn()
+        except sqlite3.OperationalError as e:
+            s = str(e).lower()
+            if ("locked" in s) or ("busy" in s):
+                time.sleep(min(max_delay, base_delay * (2 ** i)) + random.random() * base_delay)
+                continue
+            raise
+    return fn()
 
-def _format_msgs_grouped(msgs, remaining_count=0):
-    """按发送者分组格式化消息"""
+def _table_has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r["name"] == col for r in rows)
+    except Exception:
+        return False
+
+def _is_pid_alive(pid: int) -> bool:
+    """
+    Reliable PID liveness check.
+
+    Windows:
+      - Use OpenProcess + GetExitCodeProcess (STILL_ACTIVE=259)
+      - Access denied => treat as alive (avoid false deletes)
+
+    POSIX:
+      - os.kill(pid, 0) with errno handling
+    """
+    if not pid or int(pid) <= 0:
+        return False
+
+    # --- Windows ---
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259  # process is running
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            OpenProcess = k32.OpenProcess
+            OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            OpenProcess.restype = wintypes.HANDLE
+
+            GetExitCodeProcess = k32.GetExitCodeProcess
+            GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            GetExitCodeProcess.restype = wintypes.BOOL
+
+            CloseHandle = k32.CloseHandle
+            CloseHandle.argtypes = [wintypes.HANDLE]
+            CloseHandle.restype = wintypes.BOOL
+
+            h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not h:
+                err = ctypes.get_last_error()
+                # 5 = Access is denied (process may exist but not queryable)
+                if err == 5:
+                    return True
+                return False
+
+            code = wintypes.DWORD()
+            ok = GetExitCodeProcess(h, ctypes.byref(code))
+            CloseHandle(h)
+
+            if not ok:
+                # Can't query exit code => be conservative
+                return True
+
+            return code.value == STILL_ACTIVE
+
+        except Exception:
+            # last-resort conservative fallback
+            return True
+
+    # --- POSIX ---
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as e:
+        # Some systems raise generic OSError with errno=ESRCH when pid doesn't exist
+        try:
+            import errno
+            if getattr(e, "errno", None) == errno.ESRCH:
+                return False
+            if getattr(e, "errno", None) == errno.EPERM:
+                return True
+        except Exception:
+            pass
+        return True
+
+def init_db():
+    def _do():
+        with get_db() as conn:
+            with conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS peers (
+                        id TEXT PRIMARY KEY,
+                        pid INTEGER,
+                        hostname TEXT,
+                        last_seen REAL,
+                        cwd TEXT
+                    )
+                """)
+                # migrations
+                if not _table_has_column(conn, "peers", "hostname"):
+                    try:
+                        conn.execute("ALTER TABLE peers ADD COLUMN hostname TEXT")
+                    except Exception:
+                        pass
+                if not _table_has_column(conn, "peers", "cwd"):
+                    try:
+                        conn.execute("ALTER TABLE peers ADD COLUMN cwd TEXT")
+                    except Exception:
+                        pass
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS messages (
+                        msg_id TEXT PRIMARY KEY,
+                        ts REAL,
+                        ts_str TEXT,
+                        from_user TEXT,
+                        to_user TEXT,
+                        content TEXT,
+                        state TEXT DEFAULT 'queued',
+                        lease_owner TEXT,
+                        lease_until REAL,
+                        attempt INTEGER DEFAULT 0,
+                        delivered_at REAL
+                    )
+                """)
+                # migrations
+                for col, ddl in [
+                    ("state", "ALTER TABLE messages ADD COLUMN state TEXT DEFAULT 'queued'"),
+                    ("lease_owner", "ALTER TABLE messages ADD COLUMN lease_owner TEXT"),
+                    ("lease_until", "ALTER TABLE messages ADD COLUMN lease_until REAL"),
+                    ("attempt", "ALTER TABLE messages ADD COLUMN attempt INTEGER DEFAULT 0"),
+                    ("delivered_at", "ALTER TABLE messages ADD COLUMN delivered_at REAL"),
+                ]:
+                    if not _table_has_column(conn, "messages", col):
+                        try:
+                            conn.execute(ddl)
+                        except Exception:
+                            pass
+
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_to_user_ts ON messages(to_user, ts);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_state ON messages(to_user, state, lease_until, ts);")
+
+    try:
+        _db_retry(_do)
+    except Exception as e:
+        log(f"Init Warning: {e}")
+
+init_db()
+
+# ---------------- Peers / ID ----------------
+
+def _update_heartbeat(name: str, pid: int):
+    now = time.time()
+    cwd = os.getcwd()
+    host = SESSION_HOST
+
+    def do():
+        with get_db() as conn:
+            with conn:
+                cur = conn.execute(
+                    "UPDATE peers SET pid=?, hostname=?, last_seen=?, cwd=? WHERE id=?",
+                    (pid, host, now, cwd, name),
+                )
+                if cur.rowcount == 0:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO peers (id, pid, hostname, last_seen, cwd) VALUES (?, ?, ?, ?, ?)",
+                        (name, pid, host, now, cwd),
+                    )
+    try:
+        _db_retry(do)
+    except Exception:
+        pass
+
+def _claim_id_atomic(pid: int) -> str:
+    """
+    Claim a 3-digit ID. If candidate exists but is stale (last_seen < now-HEARTBEAT_TTL),
+    steal it safely.
+    """
+    now = time.time()
+    cutoff = now - HEARTBEAT_TTL
+    cwd = os.getcwd()
+    host = SESSION_HOST
+
+    for _ in range(5000):
+        cid = f"{random.randint(1, 999):03d}"
+
+        def attempt():
+            with get_db() as conn:
+                with conn:
+                    try:
+                        conn.execute(
+                            "INSERT INTO peers (id, pid, hostname, last_seen, cwd) VALUES (?, ?, ?, ?, ?)",
+                            (cid, pid, host, now, cwd),
+                        )
+                        return True
+                    except sqlite3.IntegrityError:
+                        row = conn.execute(
+                            "SELECT last_seen FROM peers WHERE id=?",
+                            (cid,),
+                        ).fetchone()
+                        if row and row["last_seen"] is not None and row["last_seen"] < cutoff:
+                            cur = conn.execute(
+                                "UPDATE peers SET pid=?, hostname=?, last_seen=?, cwd=? "
+                                "WHERE id=? AND last_seen < ?",
+                                (pid, host, now, cwd, cid, cutoff),
+                            )
+                            return cur.rowcount == 1
+                        return False
+
+        if _db_retry(attempt):
+            return cid
+
+    raise RuntimeError("ID pool exhausted")
+
+def get_session():
+    global SESSION_NAME
+    if not SESSION_NAME:
+        SESSION_NAME = _claim_id_atomic(SESSION_PID)
+        # immediate register
+        _update_heartbeat(SESSION_NAME, SESSION_PID)
+    return SESSION_NAME, SESSION_PID
+
+def _remove_self():
+    if not SESSION_NAME:
+        return
+    def do():
+        with get_db() as conn:
+            with conn:
+                conn.execute("DELETE FROM peers WHERE id=?", (SESSION_NAME,))
+    try:
+        _db_retry(do)
+    except Exception:
+        pass
+
+atexit.register(_remove_self)
+
+# signal handlers (best-effort)
+try:
+    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+except Exception:
+    pass
+try:
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+except Exception:
+    pass
+
+def _get_active_peers(my_name: str):
+    limit = time.time() - HEARTBEAT_TTL
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, hostname, cwd FROM peers WHERE last_seen > ? ORDER BY id",
+            (limit,),
+        ).fetchall()
+    return [{"id": r["id"], "host": r["hostname"], "cwd": r["cwd"]} for r in rows]
+
+# ---------------- Messages ----------------
+
+def _send_db_batch(from_user: str, recipients: list[str], content: str) -> str:
+    ts = time.time()
+    ts_str = time.strftime("%H:%M:%S")
+
+    data = []
+    first_short = None
+    for to_user in recipients:
+        mid = uuid.uuid4().hex
+        if not first_short:
+            first_short = mid[:8]
+        data.append((mid, ts, ts_str, from_user, to_user, content))
+
+    def do():
+        with get_db() as conn:
+            with conn:
+                conn.executemany(
+                    "INSERT INTO messages (msg_id, ts, ts_str, from_user, to_user, content) VALUES (?, ?, ?, ?, ?, ?)",
+                    data,
+                )
+    _db_retry(do)
+    return first_short or "--------"
+
+def _estimate_cost(row: sqlite3.Row) -> int:
+    try:
+        return len(row["content"] or "") + 60
+    except Exception:
+        return 120
+
+def _lease_messages(my_name: str, max_chars: int = MAX_BATCH_CHARS):
+    now = time.time()
+    lease_until = now + LEASE_TTL
+
+    def do():
+        with get_db() as conn:
+            with conn:
+                # recover expired inflight for this user
+                conn.execute("""
+                    UPDATE messages
+                    SET state='queued', lease_owner=NULL, lease_until=NULL
+                    WHERE to_user=? AND state='inflight' AND lease_until IS NOT NULL AND lease_until < ?
+                """, (my_name, now))
+
+                rows = conn.execute("""
+                    SELECT * FROM messages
+                    WHERE to_user=? AND state='queued'
+                    ORDER BY ts ASC
+                """, (my_name,)).fetchall()
+
+                chosen = []
+                chosen_ids = []
+                cost = 0
+
+                for r in rows:
+                    c = _estimate_cost(r)
+                    if chosen and (cost + c > max_chars):
+                        break
+                    chosen.append(dict(r))
+                    chosen_ids.append(r["msg_id"])
+                    cost += c
+
+                if chosen_ids:
+                    placeholders = ",".join("?" * len(chosen_ids))
+                    conn.execute(f"""
+                        UPDATE messages
+                        SET state='inflight',
+                            lease_owner=?,
+                            lease_until=?,
+                            attempt=COALESCE(attempt,0)+1,
+                            delivered_at=?
+                        WHERE msg_id IN ({placeholders})
+                    """, [my_name, lease_until, now, *chosen_ids])
+
+                # remaining queued count (cheap: derive from rows)
+                remaining = max(0, len(rows) - len(chosen_ids))
+                return chosen, chosen_ids, remaining
+
+    return _db_retry(do)
+
+def _ack_messages(msg_ids: list[str], my_name: str):
+    if not msg_ids:
+        return
+
+    def do():
+        with get_db() as conn:
+            with conn:
+                placeholders = ",".join("?" * len(msg_ids))
+                conn.execute(f"""
+                    DELETE FROM messages
+                    WHERE msg_id IN ({placeholders})
+                      AND state='inflight'
+                      AND lease_owner=?
+                """, [*msg_ids, my_name])
+
+    _db_retry(do)
+
+def _release_leases(msg_ids: list[str], my_name: str):
+    if not msg_ids:
+        return
+
+    def do():
+        with get_db() as conn:
+            with conn:
+                placeholders = ",".join("?" * len(msg_ids))
+                conn.execute(f"""
+                    UPDATE messages
+                    SET state='queued', lease_owner=NULL, lease_until=NULL
+                    WHERE msg_id IN ({placeholders})
+                      AND state='inflight'
+                      AND lease_owner=?
+                """, [*msg_ids, my_name])
+
+    try:
+        _db_retry(do)
+    except Exception:
+        pass
+
+def _format_msgs_grouped(msgs: list[dict], remaining: int) -> str:
     if not msgs:
         return "No messages."
 
-    # 按发送者分组
     grouped = defaultdict(list)
     for m in msgs:
-        grouped[m['from_user']].append(m)
+        grouped[m["from_user"]].append(m)
 
-    # 按时间戳排序所有组
-    sorted_senders = sorted(grouped.keys(), key=lambda x: min(m['ts'] for m in grouped[x]))
-
+    # stable sender order by first ts
+    senders = sorted(grouped.keys(), key=lambda s: min(mm["ts"] for mm in grouped[s]))
     lines = [f"=== {len(msgs)} messages from {len(grouped)} agent(s) ===\n"]
 
-    for sender in sorted_senders:
-        sender_msgs = grouped[sender]
-        lines.append(f"[{sender}] - {len(sender_msgs)} message(s)")
-        for m in sender_msgs:
+    for s in senders:
+        ms = grouped[s]
+        lines.append(f"[{s}] - {len(ms)} message(s)")
+        for m in ms:
             lines.append(f"  {m['ts_str']} {m['content']}")
         lines.append("")
 
-    if remaining_count > 0:
-        lines.append(f"({remaining_count} more message(s). Call recv() again to continue)")
-
+    if remaining > 0:
+        lines.append(f"({remaining} more queued. Call recv() again)")
     return "\n".join(lines)
 
-def _estimate_size(msgs):
-    """估算消息总字符数"""
-    total = 0
-    for m in msgs:
-        total += len(m['content']) + 50  # 内容 + 元数据估算
-    return total
+# ---------------- Background Maintenance ----------------
 
-# --- 5. MCP Tools ---
+def _clean_dead_local_peers():
+    """
+    Local janitor:
+    Checks ALL peers on SAME host (any cwd); if PID is dead => delete.
+    This cleans up dead agents regardless of which directory/project they ran in.
+    """
+    my_host = SESSION_HOST
+
+    def do():
+        with get_db() as conn:
+            with conn:
+                rows = conn.execute(
+                    "SELECT id, pid FROM peers WHERE hostname=?",  # 同机器，所有目录
+                    (my_host,),
+                ).fetchall()
+
+                dead = []
+                for r in rows:
+                    if SESSION_NAME and r["id"] == SESSION_NAME:
+                        continue
+                    pid = r["pid"]
+                    if pid is None:
+                        continue
+                    if not _is_pid_alive(int(pid)):
+                        dead.append(r["id"])
+
+                if dead:
+                    placeholders = ",".join("?" * len(dead))
+                    conn.execute(f"DELETE FROM peers WHERE id IN ({placeholders})", dead)
+
+    try:
+        _db_retry(do)
+    except Exception:
+        pass
+
+def _clean_remote_and_prune():
+    now = time.time()
+    cutoff = now - HEARTBEAT_TTL
+    msg_cutoff = now - MSG_TTL
+
+    def do():
+        with get_db() as conn:
+            with conn:
+                # expire peers by time (covers remote crashes, power loss, etc.)
+                conn.execute("DELETE FROM peers WHERE last_seen < ?", (cutoff,))
+
+                # recover any expired inflight leases (all users)
+                conn.execute("""
+                    UPDATE messages
+                    SET state='queued', lease_owner=NULL, lease_until=NULL
+                    WHERE state='inflight' AND lease_until IS NOT NULL AND lease_until < ?
+                """, (now,))
+
+                # prune old messages
+                conn.execute("DELETE FROM messages WHERE ts < ?", (msg_cutoff,))
+
+    try:
+        _db_retry(do)
+    except Exception:
+        pass
+
+def _checkpoint():
+    def do():
+        with get_db() as conn:
+            with conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                conn.execute("PRAGMA optimize;")
+    try:
+        _db_retry(do)
+    except Exception:
+        pass
+
+def _maintenance_loop():
+    name, pid = get_session()
+
+    last_local = 0.0
+    last_remote = 0.0
+    last_ckpt = 0.0
+
+    # initial sweep
+    _clean_dead_local_peers()
+    _clean_remote_and_prune()
+
+    while True:
+        now = time.time()
+        try:
+            _update_heartbeat(name, pid)
+
+            if now - last_local >= CLEAN_LOCAL_EVERY:
+                last_local = now
+                _clean_dead_local_peers()
+
+            if now - last_remote >= CLEAN_REMOTE_EVERY:
+                last_remote = now
+                _clean_remote_and_prune()
+
+            if now - last_ckpt >= CHECKPOINT_EVERY:
+                last_ckpt = now
+                _checkpoint()
+
+        except Exception:
+            pass
+
+        time.sleep(HEARTBEAT_INTERVAL)
+
+def _ensure_background_started():
+    global _BG_STARTED
+    if _BG_STARTED:
+        return
+    with _BG_LOCK:
+        if _BG_STARTED:
+            return
+        t = threading.Thread(target=_maintenance_loop, daemon=True)
+        t.start()
+        _BG_STARTED = True
+
+def _mark_active():
+    global LAST_ACTIVE_TS
+    LAST_ACTIVE_TS = time.time()
+
+# auto-register + background heartbeat at import-time
+get_session()
+_ensure_background_started()
+
+# ---------------- MCP Tools ----------------
 
 @mcp.tool()
 def get_status() -> str:
-    """Show your ID and online agents."""
+    """
+    Show your ID and currently online agents.
+    """
     _mark_active()
-    name, pid = get_session()
-    _maintenance_db(name, pid)
+    name, _ = get_session()
     peers = _get_active_peers(name)
 
-    lines = [f"YOU: {name} ({os.getcwd()})", f"ONLINE: {len(peers)}"]
+    lines = [f"YOU: {name} @ {SESSION_HOST}", f"ONLINE: {len(peers)}"]
     for p in peers:
-        marker = " - YOU" if p['id'] == name else ""
-        lines.append(f"  {p['id']} ({p['cwd']}){marker}")
-
+        marker = " - YOU" if p["id"] == name else ""
+        lines.append(f"  {p['id']} @ {p['host']} ({p['cwd']}){marker}")
     return "\n".join(lines)
 
 @mcp.tool()
 def send(to: str, content: str) -> str:
-    """Send message. to: 'all' or '001,003'."""
+    """
+    Send a message.
+    - to="123" or to="123,456" or to="all" (broadcast to all online except yourself)
+    """
     _mark_active()
-    name, pid = get_session()
-    _maintenance_db(name, pid)
+    name, _ = get_session()
 
-    recipients = [r.strip() for r in to.split(",")]
+    recipients = [r.strip() for r in (to or "").split(",") if r.strip()]
     peers = _get_active_peers(name)
-    peer_ids = [p['id'] for p in peers]
+    online_ids = [p["id"] for p in peers]
 
-    if "all" in [r.lower() for r in recipients]:
-        recipients = peer_ids
-        recipients = [r for r in recipients if r != name]
-        if not recipients:
-            return "No other agents online"
-        is_broadcast = True
+    if any(r.lower() == "all" for r in recipients):
+        final = [pid for pid in online_ids if pid != name]
+        if not final:
+            return "No other agents online."
     else:
-        is_broadcast = False
         if name in recipients:
-            return f"Error: Cannot send message to yourself"
-        for rec in recipients:
-            if rec not in peer_ids:
-                return f"Error: Agent '{rec}' not found online"
+            return "Error: cannot send to self."
+        final = []
+        for r in recipients:
+            if r not in online_ids:
+                return f"Error: Agent '{r}' offline."
+            final.append(r)
 
     try:
-        first_msg_id = None
-        for rec in recipients:
-            msg_id = _send_db(name, rec, content, is_broadcast)
-            if not first_msg_id:
-                first_msg_id = msg_id
-        return f"Sent (ID: {first_msg_id}, to {len(recipients)} recipient(s))"
+        sid = _send_db_batch(name, final, content)
+        return f"Sent (to {len(final)} agent(s), id={sid})"
     except Exception as e:
         return f"DB Error: {e}"
 
 @mcp.tool()
-async def recv(wait_seconds: int = 86400) -> str:
-    """Receive messages. Wait up to wait_seconds; cancelled if another tool is called."""
+async def recv(wait_seconds: int = 3600) -> str:
+    """
+    Receive messages (lease + batch). Unread messages are not deleted.
+    If the client forcefully aborts the tool call and the MCP link closes, restart MCP to reconnect.
+    """
     _mark_active()
-    name, pid = get_session()
-
+    name, _ = get_session()
     start = time.monotonic()
-    my_start_ts = LAST_ACTIVE_TS
+    my_task_ts = LAST_ACTIVE_TS
+    leased_ids: list[str] = []
 
-    # 消息处理函数（沿用原输出，AI 不用重新学）
-    def process_messages(messages):
-        if not messages:
+    async def try_once():
+        nonlocal leased_ids
+        msgs, leased_ids, remaining = await asyncio.to_thread(_lease_messages, name, MAX_BATCH_CHARS)
+        if not msgs:
+            leased_ids = []
             return None
-        total_size = _estimate_size(messages)
-        if total_size <= MAX_BATCH_SIZE:
-            return _format_msgs_grouped(messages)
-        # 分批处理
-        current_size = 0
-        batch_msgs = []
-        for m in messages:
-            msg_size = len(m['content']) + 50
-            if current_size + msg_size > MAX_BATCH_SIZE and batch_msgs:
-                break
-            batch_msgs.append(m)
-            current_size += msg_size
-        return _format_msgs_grouped(batch_msgs, len(messages) - len(batch_msgs))
+        out = _format_msgs_grouped(msgs, remaining)
+        # implicit ack
+        await asyncio.to_thread(_ack_messages, leased_ids, name)
+        leased_ids = []
+        return out
 
-    # 初始检查（DB IO 放线程池，避免阻塞）
     try:
-        msgs = await asyncio.to_thread(_collect_db, name)
-        result = process_messages(msgs)
-        if result:
-            return result
+        first = await try_once()
+        if first:
+            return first
+        if wait_seconds <= 0:
+            return "No new messages."
+
+        next_poll = time.monotonic() + RECV_DB_POLL_EVERY
+        while True:
+            if LAST_ACTIVE_TS != my_task_ts:
+                return "Cancelled by new command."
+            if time.monotonic() - start >= float(wait_seconds):
+                return f"Timeout ({int(wait_seconds)}s)."
+
+            now = time.monotonic()
+            if now >= next_poll:
+                next_poll = now + RECV_DB_POLL_EVERY
+                res = await try_once()
+                if res:
+                    return res
+
+            await asyncio.sleep(RECV_TICK)
+
+    except asyncio.CancelledError:
+        if leased_ids:
+            await asyncio.to_thread(_release_leases, leased_ids, name)
+        return "Cancelled."
+    except KeyboardInterrupt:
+        if leased_ids:
+            await asyncio.to_thread(_release_leases, leased_ids, name)
+        return "Cancelled."
     except Exception as e:
-        log(f"Initial check error: {e}")
-        return f"DB Read Error: {e}"
-
-    if wait_seconds <= 0:
-        return "No new messages."
-
-    next_poll_at = time.monotonic() + RECV_DB_POLL_EVERY
-    next_maint_at = time.monotonic() + RECV_MAINT_EVERY
-
-    # 长等待循环（不占用事件循环）
-    while True:
-        # 取消优先级最高
-        if LAST_ACTIVE_TS != my_start_ts:
-            return "Cancelled by new task."
-
-        elapsed = time.monotonic() - start
-        if elapsed >= wait_seconds:
-            return f"Timeout ({wait_seconds}s). No new messages."
-
-        now_m = time.monotonic()
-
-        # 维护（心跳/清理）
-        if now_m >= next_maint_at:
-            next_maint_at = now_m + RECV_MAINT_EVERY
-            try:
-                await asyncio.to_thread(_maintenance_db, name, pid)
-            except Exception as e:
-                log(f"Maintenance error: {e}")
-
-        # 拉消息
-        if now_m >= next_poll_at:
-            next_poll_at = now_m + RECV_DB_POLL_EVERY
-            try:
-                msgs = await asyncio.to_thread(_collect_db, name)
-                result = process_messages(msgs)
-                if result:
-                    return result
-            except Exception as e:
-                log(f"Recv loop error: {e}")
-
-        await asyncio.sleep(RECV_TICK)
+        if leased_ids:
+            await asyncio.to_thread(_release_leases, leased_ids, name)
+        return f"Error: {e}"
 
 if __name__ == "__main__":
     mcp.run()
