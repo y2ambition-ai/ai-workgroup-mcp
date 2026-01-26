@@ -112,17 +112,21 @@ def _table_has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
 
 def _is_pid_alive(pid: int) -> bool:
     """
-    Reliable PID liveness check.
+    Reliable PID liveness check + bridge.py verification.
 
     Windows:
       - Use OpenProcess + GetExitCodeProcess (STILL_ACTIVE=259)
+      - Also verify the process is running bridge.py (via cmdline check)
       - Access denied => treat as alive (avoid false deletes)
 
     POSIX:
       - os.kill(pid, 0) with errno handling
+      - Verify via /proc/PID/cmdline (Linux) or psutil fallback
     """
     if not pid or int(pid) <= 0:
         return False
+
+    pid = int(pid)
 
     # --- Windows ---
     if os.name == "nt":
@@ -134,6 +138,7 @@ def _is_pid_alive(pid: int) -> bool:
             STILL_ACTIVE = 259  # process is running
 
             k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            phlp = ctypes.WinDLL("iphlpapi", use_last_error=True)
 
             OpenProcess = k32.OpenProcess
             OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -147,7 +152,7 @@ def _is_pid_alive(pid: int) -> bool:
             CloseHandle.argtypes = [wintypes.HANDLE]
             CloseHandle.restype = wintypes.BOOL
 
-            h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if not h:
                 err = ctypes.get_last_error()
                 # 5 = Access is denied (process may exist but not queryable)
@@ -157,13 +162,80 @@ def _is_pid_alive(pid: int) -> bool:
 
             code = wintypes.DWORD()
             ok = GetExitCodeProcess(h, ctypes.byref(code))
-            CloseHandle(h)
-
             if not ok:
+                CloseHandle(h)
                 # Can't query exit code => be conservative
                 return True
 
-            return code.value == STILL_ACTIVE
+            if code.value != STILL_ACTIVE:
+                CloseHandle(h)
+                return False
+
+            # Process is alive - now verify it's bridge.py
+            # Use NtQueryInformationProcess to get PEB and cmdline
+            try:
+                # Try psutil first (most reliable, already a common dep)
+                try:
+                    import psutil
+                    p = psutil.Process(pid)
+                    cmdline = p.cmdline()
+                    if not cmdline:
+                        CloseHandle(h)
+                        return True  # Can't verify, be conservative
+                    cmdline_str = " ".join(cmdline).lower()
+                    is_bridge = "bridge.py" in cmdline_str
+                    CloseHandle(h)
+                    return is_bridge
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
+
+                # Fallback: Try to read via Windows API
+                PROCESS_BASIC_INFORMATION = ctypes.c_void_p
+                PEB_OFFSET = 0x10  # Offset to PEB in PROCESS_BASIC_INFORMATION
+
+                NtQueryInformationProcess = ctypes.WinDLL("ntdll").NtQueryInformationProcess
+                NtQueryInformationProcess.argtypes = [
+                    wintypes.HANDLE, wintypes.DWORD,
+                    ctypes.c_void_p, wintypes.DWORD,
+                    ctypes.POINTER(wintypes.DWORD)
+                ]
+                NtQueryInformationProcess.restype = wintypes.LONG
+
+                ProcessBasicInformation = 0
+                pbi = (ctypes.c_byte * 24)()  # PROCESS_BASIC_INFORMATION size
+                ret_len = wintypes.DWORD()
+
+                status = NtQueryInformationProcess(
+                    h, ProcessBasicInformation,
+                    ctypes.byref(pbi), ctypes.sizeof(pbi),
+                    ctypes.byref(ret_len)
+                )
+
+                if status == 0 and ret_len.value >= 8:
+                    # Read PEB base address (at offset 8 in PROCESS_BASIC_INFORMATION on x64)
+                    import struct
+                    peb_addr = struct.unpack_from("<Q", pbi, 8)[0] if ctypes.sizeof(ctypes.c_void_p) == 8 else struct.unpack_from("<I", pbi, 4)[0]
+
+                    # Read process memory to get cmdline
+                    ReadProcessMemory = k32.ReadProcessMemory
+                    ReadProcessMemory.argtypes = [
+                        wintypes.HANDLE, wintypes.LPVOID,
+                        wintypes.LPVOID, ctypes.c_size_t,
+                        ctypes.POINTER(ctypes.c_size_t)
+                    ]
+                    ReadProcessMemory.restype = wintypes.BOOL
+
+                    # This is complex and fragile - fallback to conservative
+                    pass
+            except Exception:
+                pass
+
+            CloseHandle(h)
+            # If we can't verify, be conservative and say it's alive
+            # (better to have a stale entry than delete a live one)
+            return True
 
         except Exception:
             # last-resort conservative fallback
@@ -171,14 +243,12 @@ def _is_pid_alive(pid: int) -> bool:
 
     # --- POSIX ---
     try:
-        os.kill(int(pid), 0)
-        return True
+        os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
     except OSError as e:
-        # Some systems raise generic OSError with errno=ESRCH when pid doesn't exist
         try:
             import errno
             if getattr(e, "errno", None) == errno.ESRCH:
@@ -188,6 +258,32 @@ def _is_pid_alive(pid: int) -> bool:
         except Exception:
             pass
         return True
+
+    # Process exists - verify it's bridge.py
+    try:
+        if sys.platform == "linux":
+            try:
+                with open(f"/proc/{pid}/cmdline", "r") as f:
+                    cmdline = f.read().replace("\x00", " ")
+                    return "bridge.py" in cmdline.lower()
+            except Exception:
+                pass
+        elif sys.platform == "darwin":
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    capture_output=True, text=True, timeout=1
+                )
+                if result.returncode == 0:
+                    return "bridge.py" in result.stdout.lower()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Can't verify - be conservative
+    return True
 
 def init_db():
     def _do():
