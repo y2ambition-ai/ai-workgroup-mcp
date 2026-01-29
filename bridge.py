@@ -1,17 +1,21 @@
-import os, sys, time, io, uuid, sqlite3, random, asyncio, platform, threading, atexit, signal
+import os, sys, time, io, uuid, sqlite3, random, asyncio, platform, threading, atexit
 from pathlib import Path
 from contextlib import contextmanager
 from collections import defaultdict
 from mcp.server.fastmcp import FastMCP
 
 # =========================================================
-# RootBridge - Stable Edition
+# RootBridge - Stable Leader Lease Edition (Production-ish)
+#
 # Goals:
-# 1) Background heartbeat (auto online)
-# 2) Safe local janitor (same host + same cwd + PID check)
-# 3) Remote offline via TTL
-# 4) Lease-based recv batching (no duplicates; unread won't be deleted)
-# 5) Simple MCP tools: get_status / send / recv
+# 1) Same tools: get_status / send / recv (behavior-compatible)
+# 2) Only ONE leader runs heavy maintenance (PID scan / prune / checkpoint)
+# 3) Followers do lightweight heartbeats; optional slower recv polling
+# 4) Leader election is simple + stable: DB lease lock with TTL
+#
+# Notes:
+# - sqlite is still the shared "hub"
+# - recv still works on any agent; but only leader gets "fast-poll" by default
 # =========================================================
 
 # --- 1) Basic IO (Windows UTF-8) ---
@@ -24,7 +28,7 @@ except Exception:
 mcp = FastMCP("RootBridge")
 
 # --- 2) Config ---
-BRIDGE_DB_VERSION = "v9_stable"
+BRIDGE_DB_VERSION = "v10_stable"
 BRIDGE_DB_FILENAME = f"bridge_{BRIDGE_DB_VERSION}.db"
 
 if sys.platform == "win32":
@@ -34,33 +38,43 @@ else:
     PREFERRED_ROOT = Path.home() / ".mcp_msg_pool"
     FALLBACK_ROOT = Path("/tmp/mcp_msg_pool")
 
-HEARTBEAT_TTL = 300          # seconds: remote peers expire by time
-MSG_TTL = 86400              # seconds: message retention
-LEASE_TTL = 30               # seconds: inflight lease expiry
-MAX_BATCH_CHARS = 5000       # message batch cap (approx)
+# Liveness
+HEARTBEAT_TTL = 300          # seconds: peer considered offline after this
+HEARTBEAT_INTERVAL = 10.0    # seconds: how often every agent updates its heartbeat
 
-RECV_TICK = 0.5              # asyncio sleep tick
-RECV_DB_POLL_EVERY = 2.0     # poll interval
-HEARTBEAT_INTERVAL = 10.0    # background heartbeat interval
+# Leader lock (lease)
+LEADER_LEASE_TTL = 45.0      # seconds: leader ownership duration
+LEADER_RENEW_EVERY = 15.0    # seconds: leader renew cadence (<= lease ttl)
 
-# maintenance cadence
-CLEAN_LOCAL_EVERY = 10.0     # seconds: pid-based local zombie cleanup
-CLEAN_REMOTE_EVERY = 60.0    # seconds: ttl cleanup + message prune + lease recovery
-CHECKPOINT_EVERY = 300.0     # seconds: WAL checkpoint (low frequency)
+# Messages
+MSG_TTL = 86400              # seconds: delete old messages
+LEASE_TTL = 30               # seconds: per-message inflight lease
+MAX_BATCH_CHARS = 5000
 
-# --- 3) Global State ---
+# recv loop cadence
+RECV_TICK = 0.5
+RECV_DB_POLL_EVERY_LEADER = 2.0
+RECV_DB_POLL_EVERY_FOLLOWER = 6.0   # followers poll less frequently by default
+RECV_FAST_POLL_ONLY_FOR_LEADER = True  # fast polling only when you are leader
+
+# Maintenance cadences (leader only)
+CLEAN_LOCAL_EVERY = 15.0     # PID scan on same host
+CLEAN_REMOTE_EVERY = 120.0   # prune peers/messages
+CHECKPOINT_EVERY = 600.0     # checkpoint/optimize
+
+# --- 3) Global state ---
 SESSION_NAME = None
 SESSION_PID = os.getpid()
 SESSION_HOST = platform.node()
-SESSION_CWD = os.getcwd()
 LAST_ACTIVE_TS = 0.0
 
 _BG_STARTED = False
 _BG_LOCK = threading.Lock()
 
-def log(msg: str):
-    ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}] [BRIDGE] {msg}", file=sys.stderr)
+def log(_msg: str):
+    # keep silent by default; add print() if you want diagnostics
+    # print(_msg, file=sys.stderr, flush=True)
+    pass
 
 def _choose_db_path() -> Path:
     for root in (PREFERRED_ROOT, FALLBACK_ROOT):
@@ -83,13 +97,17 @@ def get_db():
     try:
         conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
         conn.row_factory = sqlite3.Row
+        # WAL is crucial for better multi-process concurrency
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA busy_timeout=5000;")
         yield conn
     finally:
-        if conn:
-            conn.close()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def _db_retry(fn, retries: int = 7, base_delay: float = 0.03, max_delay: float = 0.35):
     for i in range(retries):
@@ -112,178 +130,46 @@ def _table_has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
 
 def _is_pid_alive(pid: int) -> bool:
     """
-    Reliable PID liveness check + bridge.py verification.
-
-    Windows:
-      - Use OpenProcess + GetExitCodeProcess (STILL_ACTIVE=259)
-      - Also verify the process is running bridge.py (via cmdline check)
-      - Access denied => treat as alive (avoid false deletes)
-
-    POSIX:
-      - os.kill(pid, 0) with errno handling
-      - Verify via /proc/PID/cmdline (Linux) or psutil fallback
+    Expensive check (esp. on Windows). Only leader calls it.
     """
-    if not pid or int(pid) <= 0:
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if pid <= 0:
         return False
 
-    pid = int(pid)
-
-    # --- Windows ---
     if os.name == "nt":
         try:
             import ctypes
             from ctypes import wintypes
-
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            STILL_ACTIVE = 259  # process is running
-
             k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            phlp = ctypes.WinDLL("iphlpapi", use_last_error=True)
-
-            OpenProcess = k32.OpenProcess
-            OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            OpenProcess.restype = wintypes.HANDLE
-
-            GetExitCodeProcess = k32.GetExitCodeProcess
-            GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-            GetExitCodeProcess.restype = wintypes.BOOL
-
-            CloseHandle = k32.CloseHandle
-            CloseHandle.argtypes = [wintypes.HANDLE]
-            CloseHandle.restype = wintypes.BOOL
-
-            h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if not h:
-                err = ctypes.get_last_error()
-                # 5 = Access is denied (process may exist but not queryable)
-                if err == 5:
-                    return True
-                return False
-
+                # Access denied => process likely exists
+                return ctypes.get_last_error() == 5
             code = wintypes.DWORD()
-            ok = GetExitCodeProcess(h, ctypes.byref(code))
+            ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+            k32.CloseHandle(h)
             if not ok:
-                CloseHandle(h)
-                # Can't query exit code => be conservative
                 return True
-
-            if code.value != STILL_ACTIVE:
-                CloseHandle(h)
-                return False
-
-            # Process is alive - now verify it's bridge.py
-            # Use NtQueryInformationProcess to get PEB and cmdline
-            try:
-                # Try psutil first (most reliable, already a common dep)
-                try:
-                    import psutil
-                    p = psutil.Process(pid)
-                    cmdline = p.cmdline()
-                    if not cmdline:
-                        CloseHandle(h)
-                        return True  # Can't verify, be conservative
-                    cmdline_str = " ".join(cmdline).lower()
-                    is_bridge = "bridge.py" in cmdline_str
-                    CloseHandle(h)
-                    return is_bridge
-                except ImportError:
-                    pass
-                except Exception:
-                    pass
-
-                # Fallback: Try to read via Windows API
-                PROCESS_BASIC_INFORMATION = ctypes.c_void_p
-                PEB_OFFSET = 0x10  # Offset to PEB in PROCESS_BASIC_INFORMATION
-
-                NtQueryInformationProcess = ctypes.WinDLL("ntdll").NtQueryInformationProcess
-                NtQueryInformationProcess.argtypes = [
-                    wintypes.HANDLE, wintypes.DWORD,
-                    ctypes.c_void_p, wintypes.DWORD,
-                    ctypes.POINTER(wintypes.DWORD)
-                ]
-                NtQueryInformationProcess.restype = wintypes.LONG
-
-                ProcessBasicInformation = 0
-                pbi = (ctypes.c_byte * 24)()  # PROCESS_BASIC_INFORMATION size
-                ret_len = wintypes.DWORD()
-
-                status = NtQueryInformationProcess(
-                    h, ProcessBasicInformation,
-                    ctypes.byref(pbi), ctypes.sizeof(pbi),
-                    ctypes.byref(ret_len)
-                )
-
-                if status == 0 and ret_len.value >= 8:
-                    # Read PEB base address (at offset 8 in PROCESS_BASIC_INFORMATION on x64)
-                    import struct
-                    peb_addr = struct.unpack_from("<Q", pbi, 8)[0] if ctypes.sizeof(ctypes.c_void_p) == 8 else struct.unpack_from("<I", pbi, 4)[0]
-
-                    # Read process memory to get cmdline
-                    ReadProcessMemory = k32.ReadProcessMemory
-                    ReadProcessMemory.argtypes = [
-                        wintypes.HANDLE, wintypes.LPVOID,
-                        wintypes.LPVOID, ctypes.c_size_t,
-                        ctypes.POINTER(ctypes.c_size_t)
-                    ]
-                    ReadProcessMemory.restype = wintypes.BOOL
-
-                    # This is complex and fragile - fallback to conservative
-                    pass
-            except Exception:
-                pass
-
-            CloseHandle(h)
-            # If we can't verify, be conservative and say it's alive
-            # (better to have a stale entry than delete a live one)
-            return True
-
+            STILL_ACTIVE = 259
+            return code.value == STILL_ACTIVE
         except Exception:
-            # last-resort conservative fallback
+            # better to keep than incorrectly delete a living peer
             return True
 
-    # --- POSIX ---
+    # POSIX
     try:
         os.kill(pid, 0)
+        return True
     except ProcessLookupError:
         return False
-    except PermissionError:
-        return True
-    except OSError as e:
-        try:
-            import errno
-            if getattr(e, "errno", None) == errno.ESRCH:
-                return False
-            if getattr(e, "errno", None) == errno.EPERM:
-                return True
-        except Exception:
-            pass
-        return True
-
-    # Process exists - verify it's bridge.py
-    try:
-        if sys.platform == "linux":
-            try:
-                with open(f"/proc/{pid}/cmdline", "r") as f:
-                    cmdline = f.read().replace("\x00", " ")
-                    return "bridge.py" in cmdline.lower()
-            except Exception:
-                pass
-        elif sys.platform == "darwin":
-            try:
-                import subprocess
-                result = subprocess.run(
-                    ["ps", "-p", str(pid), "-o", "command="],
-                    capture_output=True, text=True, timeout=1
-                )
-                if result.returncode == 0:
-                    return "bridge.py" in result.stdout.lower()
-            except Exception:
-                pass
     except Exception:
-        pass
+        return True
 
-    # Can't verify - be conservative
-    return True
+# ---------------- Schema ----------------
 
 def init_db():
     def _do():
@@ -300,15 +186,11 @@ def init_db():
                 """)
                 # migrations
                 if not _table_has_column(conn, "peers", "hostname"):
-                    try:
-                        conn.execute("ALTER TABLE peers ADD COLUMN hostname TEXT")
-                    except Exception:
-                        pass
+                    try: conn.execute("ALTER TABLE peers ADD COLUMN hostname TEXT")
+                    except Exception: pass
                 if not _table_has_column(conn, "peers", "cwd"):
-                    try:
-                        conn.execute("ALTER TABLE peers ADD COLUMN cwd TEXT")
-                    except Exception:
-                        pass
+                    try: conn.execute("ALTER TABLE peers ADD COLUMN cwd TEXT")
+                    except Exception: pass
 
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS messages (
@@ -325,7 +207,6 @@ def init_db():
                         delivered_at REAL
                     )
                 """)
-                # migrations
                 for col, ddl in [
                     ("state", "ALTER TABLE messages ADD COLUMN state TEXT DEFAULT 'queued'"),
                     ("lease_owner", "ALTER TABLE messages ADD COLUMN lease_owner TEXT"),
@@ -334,19 +215,27 @@ def init_db():
                     ("delivered_at", "ALTER TABLE messages ADD COLUMN delivered_at REAL"),
                 ]:
                     if not _table_has_column(conn, "messages", col):
-                        try:
-                            conn.execute(ddl)
-                        except Exception:
-                            pass
+                        try: conn.execute(ddl)
+                        except Exception: pass
+
+                # leader lock table
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS leader_lock (
+                        k TEXT PRIMARY KEY,
+                        owner_id TEXT,
+                        host TEXT,
+                        pid INTEGER,
+                        lease_until REAL,
+                        updated_at REAL
+                    )
+                """)
 
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_to_user_ts ON messages(to_user, ts);")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_state ON messages(to_user, state, lease_until, ts);")
-
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_to_user_state_ts ON messages(to_user, state, ts);")
     try:
         _db_retry(_do)
-    except Exception as e:
-        log(f"Init Warning: {e}")
+    except Exception:
+        pass
 
 init_db()
 
@@ -375,15 +264,12 @@ def _update_heartbeat(name: str, pid: int):
         pass
 
 def _claim_id_atomic(pid: int) -> str:
-    """
-    Claim a 3-digit ID. If candidate exists but is stale (last_seen < now-HEARTBEAT_TTL),
-    steal it safely.
-    """
     now = time.time()
     cutoff = now - HEARTBEAT_TTL
     cwd = os.getcwd()
     host = SESSION_HOST
 
+    # random 3-digit id to keep compatibility with your workflow
     for _ in range(5000):
         cid = f"{random.randint(1, 999):03d}"
 
@@ -397,14 +283,10 @@ def _claim_id_atomic(pid: int) -> str:
                         )
                         return True
                     except sqlite3.IntegrityError:
-                        row = conn.execute(
-                            "SELECT last_seen FROM peers WHERE id=?",
-                            (cid,),
-                        ).fetchone()
-                        if row and row["last_seen"] is not None and row["last_seen"] < cutoff:
+                        row = conn.execute("SELECT last_seen FROM peers WHERE id=?", (cid,)).fetchone()
+                        if row and row["last_seen"] < cutoff:
                             cur = conn.execute(
-                                "UPDATE peers SET pid=?, hostname=?, last_seen=?, cwd=? "
-                                "WHERE id=? AND last_seen < ?",
+                                "UPDATE peers SET pid=?, hostname=?, last_seen=?, cwd=? WHERE id=? AND last_seen < ?",
                                 (pid, host, now, cwd, cid, cutoff),
                             )
                             return cur.rowcount == 1
@@ -413,13 +295,12 @@ def _claim_id_atomic(pid: int) -> str:
         if _db_retry(attempt):
             return cid
 
-    raise RuntimeError("ID pool exhausted")
+    raise RuntimeError("ID pool exhausted (001-999)")
 
 def get_session():
     global SESSION_NAME
     if not SESSION_NAME:
         SESSION_NAME = _claim_id_atomic(SESSION_PID)
-        # immediate register
         _update_heartbeat(SESSION_NAME, SESSION_PID)
     return SESSION_NAME, SESSION_PID
 
@@ -437,17 +318,7 @@ def _remove_self():
 
 atexit.register(_remove_self)
 
-# signal handlers (best-effort)
-try:
-    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
-except Exception:
-    pass
-try:
-    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
-except Exception:
-    pass
-
-def _get_active_peers(my_name: str):
+def _get_active_peers():
     limit = time.time() - HEARTBEAT_TTL
     with get_db() as conn:
         rows = conn.execute(
@@ -456,12 +327,62 @@ def _get_active_peers(my_name: str):
         ).fetchall()
     return [{"id": r["id"], "host": r["hostname"], "cwd": r["cwd"]} for r in rows]
 
+# ---------------- Leader lease ----------------
+
+def _get_leader_owner() -> str | None:
+    def do():
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT owner_id, lease_until FROM leader_lock WHERE k='main'"
+            ).fetchone()
+            if not row:
+                return None
+            if (row["lease_until"] is not None) and (float(row["lease_until"]) < time.time()):
+                return None
+            return row["owner_id"]
+    try:
+        return _db_retry(do)
+    except Exception:
+        return None
+
+def _try_acquire_or_renew_leader(my_id: str, my_pid: int) -> bool:
+    now = time.time()
+    until = now + LEADER_LEASE_TTL
+
+    def do():
+        with get_db() as conn:
+            with conn:
+                # seed row
+                conn.execute("""
+                    INSERT OR IGNORE INTO leader_lock(k, owner_id, host, pid, lease_until, updated_at)
+                    VALUES ('main', ?, ?, ?, ?, ?)
+                """, (my_id, SESSION_HOST, my_pid, until, now))
+
+                # renew if self OR steal if expired
+                cur = conn.execute("""
+                    UPDATE leader_lock
+                    SET owner_id=?, host=?, pid=?, lease_until=?, updated_at=?
+                    WHERE k='main' AND (lease_until < ? OR owner_id=?)
+                """, (my_id, SESSION_HOST, my_pid, until, now, now, my_id))
+
+                if cur.rowcount == 1:
+                    return True
+
+                row = conn.execute("SELECT owner_id, lease_until FROM leader_lock WHERE k='main'").fetchone()
+                if not row:
+                    return False
+                return (row["owner_id"] == my_id) and (row["lease_until"] is not None) and (float(row["lease_until"]) >= now)
+
+    try:
+        return bool(_db_retry(do))
+    except Exception:
+        return False
+
 # ---------------- Messages ----------------
 
 def _send_db_batch(from_user: str, recipients: list[str], content: str) -> str:
     ts = time.time()
     ts_str = time.strftime("%H:%M:%S")
-
     data = []
     first_short = None
     for to_user in recipients:
@@ -481,10 +402,7 @@ def _send_db_batch(from_user: str, recipients: list[str], content: str) -> str:
     return first_short or "--------"
 
 def _estimate_cost(row: sqlite3.Row) -> int:
-    try:
-        return len(row["content"] or "") + 60
-    except Exception:
-        return 120
+    return len(row["content"] or "") + 60
 
 def _lease_messages(my_name: str, max_chars: int = MAX_BATCH_CHARS):
     now = time.time()
@@ -493,23 +411,24 @@ def _lease_messages(my_name: str, max_chars: int = MAX_BATCH_CHARS):
     def do():
         with get_db() as conn:
             with conn:
-                # recover expired inflight for this user
+                # recover my expired inflight leases
                 conn.execute("""
                     UPDATE messages
                     SET state='queued', lease_owner=NULL, lease_until=NULL
                     WHERE to_user=? AND state='inflight' AND lease_until IS NOT NULL AND lease_until < ?
                 """, (my_name, now))
 
+                # fetch a limited window to reduce cost under backlog
                 rows = conn.execute("""
                     SELECT * FROM messages
                     WHERE to_user=? AND state='queued'
                     ORDER BY ts ASC
+                    LIMIT 200
                 """, (my_name,)).fetchall()
 
                 chosen = []
                 chosen_ids = []
                 cost = 0
-
                 for r in rows:
                     c = _estimate_cost(r)
                     if chosen and (cost + c > max_chars):
@@ -527,11 +446,14 @@ def _lease_messages(my_name: str, max_chars: int = MAX_BATCH_CHARS):
                             lease_until=?,
                             attempt=COALESCE(attempt,0)+1,
                             delivered_at=?
-                        WHERE msg_id IN ({placeholders})
+                        WHERE msg_id IN ({placeholders}) AND state='queued'
                     """, [my_name, lease_until, now, *chosen_ids])
 
-                # remaining queued count (cheap: derive from rows)
-                remaining = max(0, len(rows) - len(chosen_ids))
+                # remaining count (approx) - cheap:
+                remaining = conn.execute("""
+                    SELECT COUNT(1) AS c FROM messages WHERE to_user=? AND state='queued'
+                """, (my_name,)).fetchone()["c"]
+                remaining = max(0, int(remaining) - len(chosen_ids))
                 return chosen, chosen_ids, remaining
 
     return _db_retry(do)
@@ -539,36 +461,28 @@ def _lease_messages(my_name: str, max_chars: int = MAX_BATCH_CHARS):
 def _ack_messages(msg_ids: list[str], my_name: str):
     if not msg_ids:
         return
-
     def do():
         with get_db() as conn:
             with conn:
                 placeholders = ",".join("?" * len(msg_ids))
-                conn.execute(f"""
-                    DELETE FROM messages
-                    WHERE msg_id IN ({placeholders})
-                      AND state='inflight'
-                      AND lease_owner=?
-                """, [*msg_ids, my_name])
-
+                conn.execute(
+                    f"DELETE FROM messages WHERE msg_id IN ({placeholders}) AND state='inflight' AND lease_owner=?",
+                    [*msg_ids, my_name],
+                )
     _db_retry(do)
 
 def _release_leases(msg_ids: list[str], my_name: str):
     if not msg_ids:
         return
-
     def do():
         with get_db() as conn:
             with conn:
                 placeholders = ",".join("?" * len(msg_ids))
-                conn.execute(f"""
-                    UPDATE messages
-                    SET state='queued', lease_owner=NULL, lease_until=NULL
-                    WHERE msg_id IN ({placeholders})
-                      AND state='inflight'
-                      AND lease_owner=?
-                """, [*msg_ids, my_name])
-
+                conn.execute(
+                    f"UPDATE messages SET state='queued', lease_owner=NULL, lease_until=NULL "
+                    f"WHERE msg_id IN ({placeholders}) AND state='inflight' AND lease_owner=?",
+                    [*msg_ids, my_name],
+                )
     try:
         _db_retry(do)
     except Exception:
@@ -577,58 +491,42 @@ def _release_leases(msg_ids: list[str], my_name: str):
 def _format_msgs_grouped(msgs: list[dict], remaining: int) -> str:
     if not msgs:
         return "No messages."
-
     grouped = defaultdict(list)
     for m in msgs:
         grouped[m["from_user"]].append(m)
-
-    # stable sender order by first ts
     senders = sorted(grouped.keys(), key=lambda s: min(mm["ts"] for mm in grouped[s]))
     lines = [f"=== {len(msgs)} messages from {len(grouped)} agent(s) ===\n"]
-
     for s in senders:
         ms = grouped[s]
         lines.append(f"[{s}] - {len(ms)} message(s)")
         for m in ms:
             lines.append(f"  {m['ts_str']} {m['content']}")
         lines.append("")
-
     if remaining > 0:
         lines.append(f"({remaining} more queued. Call recv() again)")
     return "\n".join(lines)
 
-# ---------------- Background Maintenance ----------------
+# ---------------- Leader maintenance ----------------
 
 def _clean_dead_local_peers():
-    """
-    Local janitor:
-    Checks ALL peers on SAME host (any cwd); if PID is dead => delete.
-    This cleans up dead agents regardless of which directory/project they ran in.
-    """
+    # leader-only, same-host pid scan
     my_host = SESSION_HOST
 
     def do():
         with get_db() as conn:
             with conn:
-                rows = conn.execute(
-                    "SELECT id, pid FROM peers WHERE hostname=?",  # 同机器，所有目录
-                    (my_host,),
-                ).fetchall()
-
+                rows = conn.execute("SELECT id, pid FROM peers WHERE hostname=?", (my_host,)).fetchall()
                 dead = []
                 for r in rows:
+                    pid = r["pid"]
+                    pid = int(pid) if pid is not None else 0
                     if SESSION_NAME and r["id"] == SESSION_NAME:
                         continue
-                    pid = r["pid"]
-                    if pid is None:
-                        continue
-                    if not _is_pid_alive(int(pid)):
+                    if pid and not _is_pid_alive(pid):
                         dead.append(r["id"])
-
                 if dead:
                     placeholders = ",".join("?" * len(dead))
                     conn.execute(f"DELETE FROM peers WHERE id IN ({placeholders})", dead)
-
     try:
         _db_retry(do)
     except Exception:
@@ -642,67 +540,73 @@ def _clean_remote_and_prune():
     def do():
         with get_db() as conn:
             with conn:
-                # expire peers by time (covers remote crashes, power loss, etc.)
                 conn.execute("DELETE FROM peers WHERE last_seen < ?", (cutoff,))
-
-                # recover any expired inflight leases (all users)
                 conn.execute("""
                     UPDATE messages
                     SET state='queued', lease_owner=NULL, lease_until=NULL
                     WHERE state='inflight' AND lease_until IS NOT NULL AND lease_until < ?
                 """, (now,))
-
-                # prune old messages
                 conn.execute("DELETE FROM messages WHERE ts < ?", (msg_cutoff,))
-
     try:
         _db_retry(do)
     except Exception:
         pass
 
 def _checkpoint():
-    def do():
-        with get_db() as conn:
-            with conn:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                conn.execute("PRAGMA optimize;")
     try:
-        _db_retry(do)
+        with get_db() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.execute("PRAGMA optimize;")
     except Exception:
         pass
 
 def _maintenance_loop():
+    """
+    Everyone: heartbeat.
+    One leader (lease lock): does heavy work.
+    """
     name, pid = get_session()
+
+    # stagger start to avoid lock herd
+    time.sleep(random.random() * 3.0)
 
     last_local = 0.0
     last_remote = 0.0
     last_ckpt = 0.0
-
-    # initial sweep
-    _clean_dead_local_peers()
-    _clean_remote_and_prune()
+    last_leader_renew = 0.0
+    is_leader = False
 
     while True:
         now = time.time()
+
         try:
+            # 1) always heartbeat (light)
             _update_heartbeat(name, pid)
 
-            if now - last_local >= CLEAN_LOCAL_EVERY:
-                last_local = now
-                _clean_dead_local_peers()
+            # 2) leader acquire/renew (not too frequent)
+            if (now - last_leader_renew) >= LEADER_RENEW_EVERY or is_leader:
+                last_leader_renew = now
+                is_leader = _try_acquire_or_renew_leader(name, pid)
 
-            if now - last_remote >= CLEAN_REMOTE_EVERY:
-                last_remote = now
-                _clean_remote_and_prune()
+            # 3) leader-only heavy tasks
+            if is_leader:
+                if now - last_local >= CLEAN_LOCAL_EVERY:
+                    last_local = now
+                    _clean_dead_local_peers()
 
-            if now - last_ckpt >= CHECKPOINT_EVERY:
-                last_ckpt = now
-                _checkpoint()
+                if now - last_remote >= CLEAN_REMOTE_EVERY:
+                    last_remote = now
+                    _clean_remote_and_prune()
+
+                if now - last_ckpt >= CHECKPOINT_EVERY:
+                    last_ckpt = now
+                    _checkpoint()
 
         except Exception:
             pass
 
-        time.sleep(HEARTBEAT_INTERVAL)
+        # base sleep + tiny jitter to desync
+        time.sleep(HEARTBEAT_INTERVAL + random.random() * 0.2)
 
 def _ensure_background_started():
     global _BG_STARTED
@@ -719,7 +623,7 @@ def _mark_active():
     global LAST_ACTIVE_TS
     LAST_ACTIVE_TS = time.time()
 
-# auto-register + background heartbeat at import-time
+# bootstrap
 get_session()
 _ensure_background_started()
 
@@ -727,30 +631,31 @@ _ensure_background_started()
 
 @mcp.tool()
 def get_status() -> str:
-    """
-    Show your ID and currently online agents.
-    """
+    """Show your ID, online agents, and current leader (lease)."""
     _mark_active()
     name, _ = get_session()
-    peers = _get_active_peers(name)
+    peers = _get_active_peers()
+    leader = _get_leader_owner()
 
-    lines = [f"YOU: {name} @ {SESSION_HOST}", f"ONLINE: {len(peers)}"]
+    lines = [f"YOU: {name} @ {SESSION_HOST}", f"ONLINE: {len(peers)}", f"LEADER: {leader or 'None'}"]
     for p in peers:
-        marker = " - YOU" if p["id"] == name else ""
+        flags = []
+        if p["id"] == leader:
+            flags.append("LEADER")
+        if p["id"] == name:
+            flags.append("YOU")
+        marker = f" ({', '.join(flags)})" if flags else ""
         lines.append(f"  {p['id']} @ {p['host']} ({p['cwd']}){marker}")
     return "\n".join(lines)
 
 @mcp.tool()
 def send(to: str, content: str) -> str:
-    """
-    Send a message.
-    - to="123" or to="123,456" or to="all" (broadcast to all online except yourself)
-    """
+    """Send a message. to='id' or 'all' (or comma-separated ids)."""
     _mark_active()
     name, _ = get_session()
 
     recipients = [r.strip() for r in (to or "").split(",") if r.strip()]
-    peers = _get_active_peers(name)
+    peers = _get_active_peers()
     online_ids = [p["id"] for p in peers]
 
     if any(r.lower() == "all" for r in recipients):
@@ -773,13 +678,15 @@ def send(to: str, content: str) -> str:
         return f"DB Error: {e}"
 
 @mcp.tool()
-async def recv(wait_seconds: int = 3600) -> str:
+async def recv(wait_seconds: int = 86400) -> str:
     """
-    Receive messages (lease + batch). Unread messages are not deleted.
-    If the client forcefully aborts the tool call and the MCP link closes, restart MCP to reconnect.
+    Receive messages.
+    - Always attempts an immediate fetch.
+    - For long waits, leader polls fast; followers poll slower by default (configurable).
     """
     _mark_active()
     name, _ = get_session()
+
     start = time.monotonic()
     my_task_ts = LAST_ACTIVE_TS
     leased_ids: list[str] = []
@@ -791,39 +698,43 @@ async def recv(wait_seconds: int = 3600) -> str:
             leased_ids = []
             return None
         out = _format_msgs_grouped(msgs, remaining)
-        # implicit ack
         await asyncio.to_thread(_ack_messages, leased_ids, name)
         leased_ids = []
         return out
 
     try:
+        # immediate attempt
         first = await try_once()
         if first:
             return first
         if wait_seconds <= 0:
             return "No new messages."
 
-        next_poll = time.monotonic() + RECV_DB_POLL_EVERY
+        # polling cadence
+        leader = _get_leader_owner()
+        is_leader = (leader == name)
+        poll_every = RECV_DB_POLL_EVERY_LEADER if (is_leader or not RECV_FAST_POLL_ONLY_FOR_LEADER) else RECV_DB_POLL_EVERY_FOLLOWER
+
+        # stagger to avoid herd when multiple agents call recv at once
+        jitter = (int(name) % 10) * 0.03 if name and name.isdigit() else random.random() * 0.2
+        next_db_poll = time.monotonic() + jitter
+
         while True:
             if LAST_ACTIVE_TS != my_task_ts:
                 return "Cancelled by new command."
             if time.monotonic() - start >= float(wait_seconds):
                 return f"Timeout ({int(wait_seconds)}s)."
 
-            now = time.monotonic()
-            if now >= next_poll:
-                next_poll = now + RECV_DB_POLL_EVERY
+            now_m = time.monotonic()
+            if now_m >= next_db_poll:
+                next_db_poll = now_m + poll_every
                 res = await try_once()
                 if res:
                     return res
 
             await asyncio.sleep(RECV_TICK)
 
-    except asyncio.CancelledError:
-        if leased_ids:
-            await asyncio.to_thread(_release_leases, leased_ids, name)
-        return "Cancelled."
-    except KeyboardInterrupt:
+    except (asyncio.CancelledError, KeyboardInterrupt):
         if leased_ids:
             await asyncio.to_thread(_release_leases, leased_ids, name)
         return "Cancelled."
