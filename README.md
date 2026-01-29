@@ -4,10 +4,10 @@ A **local-first** SQLite message bus for multi-agent collaboration.
 **Only 3 tools:** `get_status()` / `send(to, content)` / `recv(wait_seconds)`
 Zero extra infra (no Redis / no web server). Works like an "AI workgroup chat".
 
-**Engine:** v9_stable (background heartbeat + PID janitor + lease-based receive) | **Release:** [v9.0.0](https://github.com/y2ambition-ai/ai-workgroup-mcp/releases/tag/v9.0.0)
-Technical details: `docs/ENGINE_v9_STABLE.md`
+**Engine:** v10_stable (leader lease architecture - one leader handles heavy maintenance, followers do lightweight heartbeats) | **Release:** [v10.0.0](https://github.com/y2ambition-ai/ai-workgroup-mcp/releases/tag/v10.0.0)
+Technical details: `docs/ENGINE_v10_STABLE.md`
 
-Quick links: `PLAYBOOK.md` | `PLAYBOOK.zh-CN.md` | `PROMPT_GLOBAL.md` | `examples/` | `docs/ENGINE_v9_STABLE.md`
+Quick links: `PLAYBOOK.md` | `PLAYBOOK.zh-CN.md` | `PROMPT_GLOBAL.md` | `examples/` | `docs/`
 
 ---
 
@@ -20,7 +20,7 @@ pip install mcp
 claude mcp add bridge --scope=user "python" "C:/ccbridge/bridge.py"
 ```
 
-Claude Desktop users can also configure MCP via your client config (see `docs/ENGINE_v9_STABLE.md` for the JSON example).
+Claude Desktop users can also configure MCP via your client config.
 
 ---
 
@@ -63,14 +63,18 @@ Congrats — your AI team is born.
 
 ---
 
-## Message semantics (v9_stable)
+## Message semantics (v10_stable)
 
-v9_stable uses a lease queue:
+v10_stable uses a leader lease architecture:
 
-1. messages start `queued`
-2. receiver leases them to `inflight` (short lease TTL)
-3. on successful `recv`, messages are ACKed (deleted)
-4. if a tool call is aborted/crashes before ACK, leases are released/expired and messages return to `queued` (not lost)
+1. **One leader is elected** via database lease lock (TTL-based)
+2. **Only leader runs heavy maintenance**: PID scan, remote peer prune, message cleanup, checkpoint
+3. **Followers do lightweight heartbeats only**; they poll recv messages less frequently by default
+4. Messages use a lease queue:
+   - start as `queued`
+   - receiver leases them to `inflight` (short lease TTL)
+   - on successful `recv`, messages are ACKed (deleted)
+   - if a tool call is aborted/crashes before ACK, leases are released/expired and messages return to `queued` (not lost)
 
 ---
 
@@ -79,13 +83,13 @@ v9_stable uses a lease queue:
 **Windows default:**
 
 ```
-C:\mcp_msg_pool\bridge_v9_stable.db
+C:\mcp_msg_pool\bridge_v10_stable.db
 ```
 
 **Fallback if not writable:**
 
 ```
-C:\Users\Public\mcp_msg_pool\bridge_v9_stable.db
+C:\Users\Public\mcp_msg_pool\bridge_v10_stable.db
 ```
 
 Change via `PREFERRED_ROOT` / `FALLBACK_ROOT` in `bridge.py`.
