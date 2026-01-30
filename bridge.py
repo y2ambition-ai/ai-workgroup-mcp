@@ -28,7 +28,7 @@ except Exception:
 mcp = FastMCP("RootBridge")
 
 # --- 2) Config ---
-BRIDGE_DB_VERSION = "v10_stable"
+BRIDGE_DB_VERSION = "v11_stable"
 BRIDGE_DB_FILENAME = f"bridge_{BRIDGE_DB_VERSION}.db"
 
 if sys.platform == "win32":
@@ -192,6 +192,28 @@ def init_db():
                     try: conn.execute("ALTER TABLE peers ADD COLUMN cwd TEXT")
                     except Exception: pass
 
+                # recv/listen status (optional)
+                for col, ddl in [
+                    ("recv_state", "ALTER TABLE peers ADD COLUMN recv_state TEXT"),
+                    ("recv_started", "ALTER TABLE peers ADD COLUMN recv_started REAL"),
+                    ("recv_deadline", "ALTER TABLE peers ADD COLUMN recv_deadline REAL"),
+                    ("recv_wait_seconds", "ALTER TABLE peers ADD COLUMN recv_wait_seconds INTEGER"),
+                    ("recv_last_touch", "ALTER TABLE peers ADD COLUMN recv_last_touch REAL"),
+                ]:
+                    if not _table_has_column(conn, "peers", col):
+                        try: conn.execute(ddl)
+                        except Exception: pass
+
+                # mode status (optional): 'waiting' if inside recv(), otherwise 'working'
+                for col, ddl in [
+                    ("mode", "ALTER TABLE peers ADD COLUMN mode TEXT"),
+                    ("mode_since", "ALTER TABLE peers ADD COLUMN mode_since REAL"),
+                    ("active_last_touch", "ALTER TABLE peers ADD COLUMN active_last_touch REAL"),
+                ]:
+                    if not _table_has_column(conn, "peers", col):
+                        try: conn.execute(ddl)
+                        except Exception: pass
+
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS messages (
                         msg_id TEXT PRIMARY KEY,
@@ -250,13 +272,13 @@ def _update_heartbeat(name: str, pid: int):
         with get_db() as conn:
             with conn:
                 cur = conn.execute(
-                    "UPDATE peers SET pid=?, hostname=?, last_seen=?, cwd=? WHERE id=?",
-                    (pid, host, now, cwd, name),
+                    "UPDATE peers SET pid=?, hostname=?, last_seen=?, cwd=?, active_last_touch=COALESCE(?, active_last_touch), mode=COALESCE(mode, 'working'), mode_since=COALESCE(mode_since, ?) WHERE id=?",
+                    (pid, host, now, cwd, (LAST_ACTIVE_TS if LAST_ACTIVE_TS > 0 else None), now, name),
                 )
                 if cur.rowcount == 0:
                     conn.execute(
-                        "INSERT OR IGNORE INTO peers (id, pid, hostname, last_seen, cwd) VALUES (?, ?, ?, ?, ?)",
-                        (name, pid, host, now, cwd),
+                        "INSERT OR IGNORE INTO peers (id, pid, hostname, last_seen, cwd, mode, mode_since, active_last_touch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (name, pid, host, now, cwd, "working", now, (LAST_ACTIVE_TS if LAST_ACTIVE_TS > 0 else now)),
                     )
     try:
         _db_retry(do)
@@ -278,8 +300,8 @@ def _claim_id_atomic(pid: int) -> str:
                 with conn:
                     try:
                         conn.execute(
-                            "INSERT INTO peers (id, pid, hostname, last_seen, cwd) VALUES (?, ?, ?, ?, ?)",
-                            (cid, pid, host, now, cwd),
+                            "INSERT INTO peers (id, pid, hostname, last_seen, cwd, mode, mode_since, active_last_touch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (cid, pid, host, now, cwd, "working", now, now),
                         )
                         return True
                     except sqlite3.IntegrityError:
@@ -322,10 +344,75 @@ def _get_active_peers():
     limit = time.time() - HEARTBEAT_TTL
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT id, hostname, cwd FROM peers WHERE last_seen > ? ORDER BY id",
+            "SELECT id, hostname, cwd, mode, mode_since, active_last_touch, recv_state, recv_started, recv_deadline, recv_wait_seconds, recv_last_touch "
+            "FROM peers WHERE last_seen > ? ORDER BY id",
             (limit,),
         ).fetchall()
-    return [{"id": r["id"], "host": r["hostname"], "cwd": r["cwd"]} for r in rows]
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "host": r["hostname"],
+            "cwd": r["cwd"],
+            "mode": r["mode"] if "mode" in r.keys() else None,
+            "mode_since": r["mode_since"] if "mode_since" in r.keys() else None,
+            "active_last_touch": r["active_last_touch"] if "active_last_touch" in r.keys() else None,
+            "recv_state": r["recv_state"] if "recv_state" in r.keys() else None,
+            "recv_started": r["recv_started"] if "recv_started" in r.keys() else None,
+            "recv_deadline": r["recv_deadline"] if "recv_deadline" in r.keys() else None,
+            "recv_wait_seconds": r["recv_wait_seconds"] if "recv_wait_seconds" in r.keys() else None,
+            "recv_last_touch": r["recv_last_touch"] if "recv_last_touch" in r.keys() else None,
+        })
+    return out
+
+
+# ---------------- Recv/listen status ----------------
+
+def _set_recv_waiting(name: str, wait_seconds: int):
+    """
+    Mark this peer as currently waiting inside recv().
+    This is purely for observability (team lead can see who is waiting).
+    """
+    now = time.time()
+    deadline = now + float(wait_seconds) if (wait_seconds and wait_seconds > 0) else None
+
+    def do():
+        with get_db() as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE peers SET recv_state=?, recv_started=?, recv_deadline=?, recv_wait_seconds=?, recv_last_touch=?, mode='waiting', mode_since=?, active_last_touch=? "
+                    "WHERE id=?",
+                    ("waiting", now, deadline, int(wait_seconds), now, now, now, name),
+                )
+    try:
+        _db_retry(do)
+    except Exception:
+        pass
+
+def _touch_recv_waiting(name: str):
+    now = time.time()
+    def do():
+        with get_db() as conn:
+            with conn:
+                conn.execute("UPDATE peers SET recv_last_touch=?, active_last_touch=COALESCE(?, active_last_touch) WHERE id=? AND recv_state='waiting'", (now, (LAST_ACTIVE_TS if LAST_ACTIVE_TS > 0 else None), name))
+    try:
+        _db_retry(do)
+    except Exception:
+        pass
+
+def _clear_recv_waiting(name: str):
+    def do():
+        with get_db() as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE peers SET recv_state=NULL, recv_started=NULL, recv_deadline=NULL, recv_wait_seconds=NULL, recv_last_touch=NULL, mode='working', mode_since=?, active_last_touch=COALESCE(?, active_last_touch) "
+                    "WHERE id=?",
+                    (time.time(), (LAST_ACTIVE_TS if LAST_ACTIVE_TS > 0 else None), name),
+                )
+    try:
+        _db_retry(do)
+    except Exception:
+        pass
 
 # ---------------- Leader lease ----------------
 
@@ -541,6 +628,12 @@ def _clean_remote_and_prune():
         with get_db() as conn:
             with conn:
                 conn.execute("DELETE FROM peers WHERE last_seen < ?", (cutoff,))
+                # clear stale "waiting" flags (e.g., agent crashed or timed out)
+                conn.execute("""
+                    UPDATE peers
+                    SET recv_state=NULL, recv_started=NULL, recv_deadline=NULL, recv_wait_seconds=NULL, recv_last_touch=NULL
+                    WHERE recv_state IS NOT NULL AND recv_deadline IS NOT NULL AND recv_deadline < ?
+                """, (now,))
                 conn.execute("""
                     UPDATE messages
                     SET state='queued', lease_owner=NULL, lease_until=NULL
@@ -631,23 +724,86 @@ _ensure_background_started()
 
 @mcp.tool()
 def get_status() -> str:
-    """Show your ID, online agents, and current leader (lease)."""
+    """List online agents with role + state timers.
+
+    Output format example:
+      Agent 001 @ Server-A  [👑 LEADER | YOU | 🎧 Waiting (12s/86400s)]
+        Agent 002 @ Server-B  [🛠 Working (18s)]
+        Agent 003 @ Server-C  [🎧 Waiting (500s/3600s)]
+
+    Semantics:
+    - 🎧 Waiting: the agent is currently blocked inside recv(wait_seconds=...).
+    - 🛠 Working: the agent is online but not currently in recv() waiting state (may be executing tasks or idle).
+    - If Working exceeds ~30 minutes, a ❓ marker is shown to help spot "maybe stuck / still working?".
+    """
     _mark_active()
-    name, _ = get_session()
+    me, _ = get_session()
     peers = _get_active_peers()
     leader = _get_leader_owner()
+    now = time.time()
 
-    lines = [f"YOU: {name} @ {SESSION_HOST}", f"ONLINE: {len(peers)}", f"LEADER: {leader or 'None'}"]
-    for p in peers:
+    # Order: leader first, then YOU, then others
+    def sort_key(p):
+        if leader and p["id"] == leader:
+            return (0, p["id"])
+        if p["id"] == me:
+            return (1, p["id"])
+        return (2, p["id"])
+
+    peers_sorted = sorted(peers, key=sort_key)
+
+    lines = []
+    for i, p in enumerate(peers_sorted):
         flags = []
-        if p["id"] == leader:
-            flags.append("LEADER")
-        if p["id"] == name:
+        if leader and p["id"] == leader:
+            flags.append("👑 LEADER")
+        if p["id"] == me:
             flags.append("YOU")
-        marker = f" ({', '.join(flags)})" if flags else ""
-        lines.append(f"  {p['id']} @ {p['host']} ({p['cwd']}){marker}")
-    return "\n".join(lines)
 
+        # state
+        state_str = ""
+        if (p.get("recv_state") == "waiting") and p.get("recv_started"):
+            try:
+                elapsed = max(0, int(now - float(p["recv_started"])))
+            except Exception:
+                elapsed = 0
+            total = p.get("recv_wait_seconds") or 0
+            if total and int(total) > 0:
+                state_str = f"🎧 Waiting ({elapsed}s/{int(total)}s)"
+            else:
+                state_str = f"🎧 Waiting ({elapsed}s)"
+        else:
+            # default: working
+            since = p.get("mode_since") or p.get("active_last_touch") or p.get("recv_last_touch") or None
+            if since:
+                try:
+                    w_elapsed = max(0, int(now - float(since)))
+                except Exception:
+                    w_elapsed = 0
+            else:
+                w_elapsed = 0
+
+            if w_elapsed >= 1800:  # 30 min
+                state_str = f"❓ Working ({w_elapsed}s)"
+            else:
+                state_str = f"🛠 Working ({w_elapsed}s)"
+
+        parts = []
+        if flags:
+            parts.extend(flags)
+        parts.append(state_str)
+
+        bracket = " | ".join(parts)
+
+        host = p.get("host") or "UnknownHost"
+        line = f"Agent {p['id']} @ {host}  [{bracket}]"
+
+        # indent everyone except the first line (usually leader)
+        if i > 0:
+            line = "  " + line
+        lines.append(line)
+
+    return "\n".join(lines) if lines else "No active agents."
 @mcp.tool()
 def send(to: str, content: str) -> str:
     """Send a message. to='id' or 'all' (or comma-separated ids)."""
@@ -683,6 +839,7 @@ async def recv(wait_seconds: int = 86400) -> str:
     Receive messages.
     - Always attempts an immediate fetch.
     - For long waits, leader polls fast; followers poll slower by default (configurable).
+    - While waiting, we write recv/listen status into `peers` for observability.
     """
     _mark_active()
     name, _ = get_session()
@@ -690,6 +847,7 @@ async def recv(wait_seconds: int = 86400) -> str:
     start = time.monotonic()
     my_task_ts = LAST_ACTIVE_TS
     leased_ids: list[str] = []
+    waiting_marked = False
 
     async def try_once():
         nonlocal leased_ids
@@ -710,6 +868,10 @@ async def recv(wait_seconds: int = 86400) -> str:
         if wait_seconds <= 0:
             return "No new messages."
 
+        # mark "waiting" (only if we actually enter the wait loop)
+        waiting_marked = True
+        await asyncio.to_thread(_set_recv_waiting, name, int(wait_seconds))
+
         # polling cadence
         leader = _get_leader_owner()
         is_leader = (leader == name)
@@ -728,6 +890,8 @@ async def recv(wait_seconds: int = 86400) -> str:
             now_m = time.monotonic()
             if now_m >= next_db_poll:
                 next_db_poll = now_m + poll_every
+                await asyncio.to_thread(_touch_recv_waiting, name)
+
                 res = await try_once()
                 if res:
                     return res
@@ -742,6 +906,12 @@ async def recv(wait_seconds: int = 86400) -> str:
         if leased_ids:
             await asyncio.to_thread(_release_leases, leased_ids, name)
         return f"Error: {e}"
+    finally:
+        if waiting_marked:
+            try:
+                await asyncio.to_thread(_clear_recv_waiting, name)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     mcp.run()
