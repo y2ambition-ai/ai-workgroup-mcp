@@ -135,6 +135,7 @@ def init_db(agent_id: str, pid: int, hostname: str, cwd: str) -> None:
                 mode, mode_since, active_last_touch
             ) VALUES ('main', ?, ?, ?, ?, 'working', ?, ?)
         """, (now, pid, hostname, cwd, now, now))
+        conn.commit()
 
 def claim_id() -> str:
     """

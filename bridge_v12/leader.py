@@ -36,19 +36,19 @@ def is_i_leader(online_agents: list[str]) -> bool:
     leader_id = get_leader_id(online_agents)
     return leader_id == my_id
 
-def deliver_message(msg: dict, online_agents: list[str]) -> bool:
+def deliver_message(msg: dict, from_id: str, online_agents: list[str]) -> bool:
     """
     将消息从 outbox 搬运到目标 inbox
 
     Args:
         msg: 消息记录（包含 msg_id, to_id, content, ts_str, from_id）
+        from_id: 发送者 Agent ID
         online_agents: 在线 Agent ID 列表
 
     Returns:
         是否成功搬运
     """
     to_id = msg["to_id"]
-    from_id = msg.get("from_id", "unknown")
 
     targets = []
     if to_id == "all":
@@ -70,6 +70,7 @@ def deliver_message(msg: dict, online_agents: list[str]) -> bool:
                     INSERT INTO inbox (msg_id, ts, ts_str, from_id, content)
                     VALUES (?, ?, ?, ?, ?)
                 """, (msg["msg_id"], msg["ts"], msg["ts_str"], from_id, msg["content"]))
+                conn.commit()
         except Exception:
             # Silently ignore delivery errors - target database may be temporarily locked
             return False
@@ -109,7 +110,7 @@ def process_one_agent(agent_id: str, online_agents: list[str]) -> None:
     # 在 DB 外处理消息
     delivered_ids = []
     for msg in outbox_msgs:
-        if deliver_message(msg, online_agents):
+        if deliver_message(msg, agent_id, online_agents):
             delivered_ids.append(msg["msg_id"])
 
     # 重新打开，清理 + 写结果
@@ -128,6 +129,8 @@ def process_one_agent(agent_id: str, online_agents: list[str]) -> None:
                     VALUES ('main', ?, ?)
                 """, (all_status, time.time()))
                 conn.execute("UPDATE self_state SET status_request=0 WHERE key='main'")
+
+            conn.commit()
     except Exception:
         # Silently ignore cleanup errors - may retry next cycle
         pass
