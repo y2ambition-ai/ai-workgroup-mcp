@@ -42,9 +42,9 @@ try:
 except Exception as e:
     print(f"[FATAL] {e}", file=sys.stderr)
 
-HEARTBEAT_TTL = 60.0    # 离线阈值
-ZOMBIE_TTL    = 3600.0  # 清理阈值
-LEADER_TTL    = 40.0
+HEARTBEAT_TTL = 12.0    # 离线阈值（秒）：超过此时间未更新心跳视为离线
+ZOMBIE_TTL    = 3600.0  # 清理阈值（秒）：超过此时间未更新心跳的文件夹会被删除
+LEADER_TTL    = 10.0    # Leader过期时间（秒）：超过此时间未更新则重新选举
 
 # --- Identity ---
 SESSION_ID = None
@@ -64,16 +64,16 @@ def _atomic_write(target: Path, content: dict) -> bool:
         tmp = target.with_suffix(".tmp")
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(content, f, ensure_ascii=False)
-        
+
         os.replace(tmp, target)
-        
+
         # [Constraint] 物理回读校验
         # 即使 Recv 秒删，只要在 rename 后存在过哪怕 1ms，OS 也会确认
         # 配合 Recv 的 1.5s 延迟删除，这里绝对安全
         if target.exists() and target.stat().st_size > 0:
             return True
         return False
-    except:
+    except (OSError, json.JSONDecodeError, PermissionError) as e:
         return False
 
 def _update_state(state: str):
@@ -99,7 +99,8 @@ def setup_session(name):
         MY_FOLDER.mkdir(parents=True, exist_ok=True)
         MY_INBOX.mkdir(exist_ok=True)
         _update_state("NORMAL")
-    except: pass
+    except OSError as e:
+        print(f"[WARN] Failed to create session folders: {e}", file=sys.stderr)
 
 def get_id():
     global SESSION_ID
@@ -123,7 +124,7 @@ def leader_loop():
     while True:
         get_id()
         _update_state(CURRENT_STATE)
-        
+
         leader_file = POOL_ROOT / "leader.json"
         now = time.time()
         is_leader = False
@@ -134,18 +135,26 @@ def leader_loop():
                     is_leader = True
             else:
                 is_leader = True
-                
+
             if is_leader:
                 _atomic_write(leader_file, {"pid": os.getpid(), "ts": now})
-                # 慢清理：1小时
+                # 清理：1小时无心跳 或 没有heartbeat.json的僵尸文件夹
                 for p in POOL_ROOT.iterdir():
-                    if p.is_dir() and (p / "heartbeat.json").exists():
-                        try:
-                            hb = json.loads((p / "heartbeat.json").read_text(encoding='utf-8'))
+                    if not p.is_dir(): continue
+                    if p.name == "leader.json": continue  # 保护 leader.json
+                    try:
+                        hb_file = p / "heartbeat.json"
+                        if hb_file.exists():
+                            hb = json.loads(hb_file.read_text(encoding='utf-8'))
                             if now - hb['ts'] > ZOMBIE_TTL:
                                 shutil.rmtree(p)
-                        except: pass
-        except: pass
+                        else:
+                            # 僵尸文件夹：没有 heartbeat.json，直接删除
+                            shutil.rmtree(p)
+                    except (OSError, json.JSONDecodeError, PermissionError) as e:
+                        print(f"[WARN] Failed to cleanup {p.name}: {e}", file=sys.stderr)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[WARN] Leader loop error: {e}", file=sys.stderr)
         time.sleep(5.0)
 
 threading.Thread(target=leader_loop, daemon=True).start()
@@ -167,23 +176,35 @@ def status() -> str:
             try:
                 d = json.loads(hb.read_text(encoding='utf-8'))
                 age = now - d['ts']
-                
+
                 # [Constraint 1] 彻底隐藏离线者
                 if age > HEARTBEAT_TTL: continue
-                
+
                 name = p.name
                 state = d.get('state', 'NORMAL')
-                
+
                 mark = " *" if str(name) == str(SESSION_ID) else ""
                 icon = "⏳" if state == "WAITING" else "🟢"
                 lines.append(f"{icon} {name}{mark}")
-            except: pass
+            except (OSError, json.JSONDecodeError, KeyError):
+                pass
             
     return "\n".join(lines) if lines else "None"
 
 @mcp.tool()
 def rename(new_name: str) -> str:
-    """Change my ID. Only alphanumeric, '-', '_' allowed."""
+    """
+    修改自己的 Agent ID
+
+    Args:
+        new_name: 新名称（只允许字母、数字、-、_）
+
+    Returns:
+        "OK" - 成功
+        "Invalid" - 名称包含非法字符
+        "Name taken" - 名称已被在线 Agent 占用
+        "Fail" - 修改失败（文件系统错误）
+    """
     global SESSION_ID, MY_FOLDER, MY_INBOX
     old = get_id()
     safe = "".join([c for c in new_name if c.isalnum() or c in ('-', '_')])
@@ -194,9 +215,12 @@ def rename(new_name: str) -> str:
         try:
             d = json.loads((target / "heartbeat.json").read_text(encoding='utf-8'))
             if time.time() - d['ts'] < HEARTBEAT_TTL: return "Name taken"
-        except: pass
-        try: shutil.rmtree(target)
-        except: pass
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
+        try:
+            shutil.rmtree(target)
+        except PermissionError as e:
+            print(f"[WARN] Cannot remove target folder: {e}", file=sys.stderr)
 
     try:
         os.rename(MY_FOLDER, target)
@@ -209,22 +233,44 @@ def rename(new_name: str) -> str:
 
 @mcp.tool()
 def send(to: str, msg: str) -> str:
-    """Send message. to="all" for everyone, or comma-separated like "agent_1,agent_2"."""
+    """
+    发送消息给其他 Agent
+
+    Args:
+        to: 目标 Agent，"all" 表示所有人，或逗号分隔如 "agent_1,agent_2"
+        msg: 消息内容（字符串）
+
+    Returns:
+        "OK" - 成功发送给至少一个目标
+        "Fail" - 所有目标都发送失败
+        "No target" - 没有找到有效目标
+    """
     sender = get_id()
     targets = []
-    
+    now = time.time()
+
     if to == "all":
-        targets = [p for p in POOL_ROOT.iterdir() if p.is_dir() and p.name != sender]
+        # 过滤离线者
+        for p in POOL_ROOT.iterdir():
+            if not p.is_dir() or p.name == sender:
+                continue
+            hb = p / "heartbeat.json"
+            if hb.exists():
+                try:
+                    d = json.loads(hb.read_text(encoding='utf-8'))
+                    if now - d['ts'] <= HEARTBEAT_TTL:
+                        targets.append(p)
+                except: pass
     else:
         for r in to.split(","):
             t = POOL_ROOT / r.strip()
             if t.exists(): targets.append(t)
-    
+
     if not targets: return "No target"
 
     payload = {"from": sender, "msg": msg, "ts": time.time()}
     fname = f"{time.time()}_{uuid.uuid4().hex}.json"
-    
+
     success = 0
     for folder in targets:
         inbox = folder / "inbox"
@@ -232,12 +278,23 @@ def send(to: str, msg: str) -> str:
         # [Constraint 2] 强校验：只有文件物理存在才算成功
         if _atomic_write(inbox / fname, payload):
             success += 1
-            
+
     return "OK" if success > 0 else "Fail"
 
 @mcp.tool()
 def recv(wait: int = 86400) -> str:
-    """Block wait for messages. Returns "Timeout" if no message within wait seconds."""
+    """
+    阻塞等待接收消息
+
+    Args:
+        wait: 超时秒数，默认 86400（24 小时）
+
+    Returns:
+        单条消息: "[agent_123 14:30:05]: 消息内容"
+        多条合并: "[agent_123 x3]:\n - [14:30:05] 消息1\n - [14:31:10] 消息2"
+        超时: "Timeout"
+        错误: "Error"
+    """
     get_id()
     start = time.time()
     _update_state("WAITING")
@@ -260,9 +317,12 @@ def recv(wait: int = 86400) -> str:
                         files_to_delete.append(f)
                     except json.JSONDecodeError:
                         # 坏文件立即删，不卡队列
-                        try: f.unlink()
-                        except: pass
-                    except: pass # 文件被锁？跳过下次再读
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass
+                    except OSError:
+                        pass # 文件被锁？跳过下次再读
 
                 if valid_msgs:
                     # [Constraint 3] 延迟删除 (Holding Phase)
@@ -299,7 +359,8 @@ def recv(wait: int = 86400) -> str:
                 return "Timeout"
             
             time.sleep(2.0)
-    except:
+    except Exception as e:
+        print(f"[ERROR] Recv error: {e}", file=sys.stderr)
         _update_state("NORMAL")
         return "Error"
 
