@@ -12,16 +12,18 @@ from itertools import groupby
 from mcp.server.fastmcp import FastMCP
 
 # =========================================================
-# RootBridge - v26 Clean Edition
+# RootBridge - v27 Leader Notifications
 #
 # Changes:
-# - Removed SESSION_ID_FILE (badge) mechanism
-# - Fixed ID generation race condition with atomic mkdir
+# - Worker 进入待命模式时自动通知 Leader（名字含 "leader"）
+# - 闲置提醒：每 3 分钟通知一次已等待时长
+# - 通知策略：NORMAL → WAITING 立刻通知，WAITING → WAITING 每 3 分钟提醒
 #
 # Core:
 # 1. Send: Writes and immediately verifies existence.
 # 2. Recv: Reads -> Sleeps 1.5s -> Deletes. (Fixes race condition)
 # 3. Status: Hides offline agents.
+# 4. Leader Notify: Worker 自动通知 Leader 待命状态
 # =========================================================
 
 try:
@@ -51,6 +53,7 @@ SESSION_ID = None
 MY_FOLDER = None
 MY_INBOX = None
 CURRENT_STATE = "NORMAL"
+LAST_READY_NOTIFY_TIME = 0.0  # 上次发送待命通知的时间
 
 # --- Helpers ---
 
@@ -121,6 +124,10 @@ def get_id():
 # --- Leader Loop ---
 
 def leader_loop():
+    # 上次死锁警告时间（避免频繁打扰）
+    last_deadlock_warning = 0
+    DEADLOCK_WARNING_COOLDOWN = 60.0  # 60秒冷却时间
+
     while True:
         get_id()
         _update_state(CURRENT_STATE)
@@ -138,7 +145,12 @@ def leader_loop():
 
             if is_leader:
                 _atomic_write(leader_file, {"pid": os.getpid(), "ts": now})
+
                 # 清理：1小时无心跳 或 没有heartbeat.json的僵尸文件夹
+                all_waiting = True
+                online_count = 0
+                business_leader = None
+
                 for p in POOL_ROOT.iterdir():
                     if not p.is_dir(): continue
                     if p.name == "leader.json": continue  # 保护 leader.json
@@ -148,11 +160,38 @@ def leader_loop():
                             hb = json.loads(hb_file.read_text(encoding='utf-8'))
                             if now - hb['ts'] > ZOMBIE_TTL:
                                 shutil.rmtree(p)
+                            else:
+                                # 统计在线状态
+                                if now - hb['ts'] <= HEARTBEAT_TTL:
+                                    online_count += 1
+                                    if hb.get('state') != "WAITING":
+                                        all_waiting = False
+                                    # 找业务 Leader
+                                    if "leader" in p.name.lower():
+                                        business_leader = p
                         else:
                             # 僵尸文件夹：没有 heartbeat.json，直接删除
                             shutil.rmtree(p)
                     except (OSError, json.JSONDecodeError, PermissionError) as e:
                         print(f"[WARN] Failed to cleanup {p.name}: {e}", file=sys.stderr)
+
+                # 死锁检测：所有人都在等待且至少2人在线
+                if all_waiting and online_count >= 2 and business_leader:
+                    # 检查冷却时间
+                    if now - last_deadlock_warning > DEADLOCK_WARNING_COOLDOWN:
+                        # 发送系统警告给业务 Leader
+                        inbox = business_leader / "inbox"
+                        inbox.mkdir(exist_ok=True)
+                        payload = {
+                            "from": "SYSTEM",
+                            "msg": "⚠️ 死锁警告：所有人都在等待分配任务，都在监听状态。请 Leader 发送指令打破僵局！",
+                            "ts": now
+                        }
+                        fname = f"{now}_system_deadlock_warning.json"
+                        if _atomic_write(inbox / fname, payload):
+                            print(f"[SYSTEM] Deadlock detected, warning sent to {business_leader.name}", file=sys.stderr)
+                            last_deadlock_warning = now
+
         except (OSError, json.JSONDecodeError) as e:
             print(f"[WARN] Leader loop error: {e}", file=sys.stderr)
         time.sleep(5.0)
@@ -164,11 +203,11 @@ atexit.register(lambda: (MY_FOLDER / "heartbeat.json").unlink(missing_ok=True) i
 
 @mcp.tool()
 def status() -> str:
-    """List all ONLINE agents. 🟢=Normal, ⏳=Waiting for messages. * marks self."""
+    """List all ONLINE agents. 🟢=Normal, ⏳=Waiting for messages. * marks self. 👑 marks Leader (name contains 'leader')."""
     get_id()
     lines = []
     now = time.time()
-    
+
     for p in POOL_ROOT.iterdir():
         if not p.is_dir(): continue
         hb = p / "heartbeat.json"
@@ -183,12 +222,15 @@ def status() -> str:
                 name = p.name
                 state = d.get('state', 'NORMAL')
 
-                mark = " *" if str(name) == str(SESSION_ID) else ""
+                # 标记：自己、Leader（名字包含 "leader" 不区分大小写）
+                is_self = " *" if str(name) == str(SESSION_ID) else ""
+                is_leader = " 👑" if "leader" in name.lower() else ""
+
                 icon = "⏳" if state == "WAITING" else "🟢"
-                lines.append(f"{icon} {name}{mark}")
+                lines.append(f"{icon} {name}{is_self}{is_leader}")
             except (OSError, json.JSONDecodeError, KeyError):
                 pass
-            
+
     return "\n".join(lines) if lines else "None"
 
 @mcp.tool()
@@ -297,7 +339,47 @@ def recv(wait: int = 86400) -> str:
     """
     get_id()
     start = time.time()
+
+    # 通知策略：
+    # 1. NORMAL → WAITING：立刻通知
+    # 2. WAITING → WAITING：每 3 分钟发一次闲置提醒
+    global LAST_READY_NOTIFY_TIME
+    state_changed = (CURRENT_STATE != "WAITING")
+    time_since_last_notify = time.time() - LAST_READY_NOTIFY_TIME
+    should_notify = state_changed or time_since_last_notify >= 180.0  # 3分钟 = 180秒
+
     _update_state("WAITING")
+
+    if should_notify:
+        # 计算已等待时间
+        if state_changed:
+            waiting_msg = f"{SESSION_ID} 进入待命模式，等待接收新指令"
+            LAST_READY_NOTIFY_TIME = time.time()
+        else:
+            waiting_minutes = int(time_since_last_notify / 60)
+            waiting_msg = f"{SESSION_ID} 待命中，已等待 {waiting_minutes} 分钟"
+            LAST_READY_NOTIFY_TIME = time.time()
+
+        # 通知 leader
+        try:
+            for p in POOL_ROOT.iterdir():
+                if not p.is_dir(): continue
+                if "leader" in p.name.lower() and p.name != SESSION_ID:
+                    hb = p / "heartbeat.json"
+                    if hb.exists():
+                        d = json.loads(hb.read_text(encoding='utf-8'))
+                        if time.time() - d['ts'] <= HEARTBEAT_TTL:
+                            inbox = p / "inbox"
+                            inbox.mkdir(exist_ok=True)
+                            payload = {
+                                "from": "SYSTEM",
+                                "msg": waiting_msg,
+                                "ts": time.time()
+                            }
+                            fname = f"{time.time()}_{uuid.uuid4().hex}.json"
+                            _atomic_write(inbox / fname, payload)
+                            break
+        except: pass
     
     try:
         while True:
